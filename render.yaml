@@ -1,0 +1,19 @@
+# One-click always-on host: https://dashboard.render.com/select-repo?type=blueprint
+# Free web service sleeps after ~15m idle — first multiplayer join may take ~30s to wake.
+services:
+  - type: web
+    name: paintfield
+    runtime: node
+    plan: free
+    region: frankfurt
+    # --include=dev: NODE_ENV=production would skip vite otherwise.
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 10000

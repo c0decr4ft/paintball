@@ -1,0 +1,24 @@
+name: Keep Render awake
+
+# Render free tier sleeps after ~15 min idle.
+on:
+  schedule:
+    - cron: "*/45 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: keep-awake
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Ping health endpoint for ~50 minutes
+        run: |
+          for i in $(seq 1 100); do
+            status=$(curl -s -o /dev/null -w "%{http_code}" -m 20 https://paintfield.onrender.com/healthz || true)
+            echo "$(date -u +%H:%M:%S) healthz → HTTP $status"
+            sleep 30
+          done

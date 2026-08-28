@@ -5,14 +5,20 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "server": "node server/index.mjs",
+    "dev:online": "concurrently -k -n web,ws -c cyan,magenta \"vite\" \"node server/index.mjs\"",
+    "start": "node server/index.mjs",
+    "start:local": "npm run dev:online",
     "build": "vite build",
     "preview": "vite preview",
     "pages": "vite build && rm -rf docs && cp -R dist docs && rm -rf docs/models"
   },
   "dependencies": {
-    "three": "^0.170.0"
+    "three": "^0.170.0",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
+    "concurrently": "^9.2.1",
     "vite": "^6.0.11"
   }
 }

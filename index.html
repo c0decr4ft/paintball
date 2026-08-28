@@ -3,11 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PAINTFIELD</title>
+    <title>PAINFIELD</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Barlow:wght@400;600;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap"
       rel="stylesheet"
     />
   </head>
@@ -15,80 +15,73 @@
     <canvas id="c"></canvas>
 
     <div id="menu">
-      <div class="menu-card">
-        <p class="kicker">5v5 plywood field</p>
-        <h1>PAINTFIELD</h1>
-        <p class="tag">
-          Team Blue vs Team Red. First to 5 rounds. Peek the plywood, paint
-          the other squad. Friendly fire is off.
-        </p>
-        <ul class="controls">
-          <li><kbd>W A S D</kbd> Move</li>
-          <li><kbd>Mouse</kbd> Look</li>
-          <li><kbd>Click</kbd> Fire marker</li>
-          <li><kbd>Shift</kbd> Sprint &nbsp; <kbd>Space</kbd> Jump / Spectate</li>
-          <li><kbd>C</kbd> Crouch &nbsp; <kbd>R</kbd> Reload &nbsp; <kbd>Esc</kbd> Pause</li>
-        </ul>
-        <button id="play" type="button">DROP IN</button>
-        <p class="hint">You are Team Blue. One hit wipes. When wiped, Space cycles AI cams. Paint stays on the field.</p>
+      <div class="menu-shell">
+        <h1>PAINFIELD</h1>
+        <p class="tag">Loading…</p>
+        <div class="mode-row">
+          <button id="play" type="button">Play</button>
+          <button id="event" type="button" class="alt">Endless</button>
+          <button id="bomb" type="button" class="alt">Bomb</button>
+          <button id="online" type="button" class="alt">Online</button>
+        </div>
       </div>
+    </div>
+
+    <div id="intro" hidden>
+      <p>one hit five lives...</p>
     </div>
 
     <div id="hud" hidden>
       <div class="crosshair" aria-hidden="true">
         <span></span><span></span><span></span><span></span>
       </div>
-      <div class="top-bar">
-        <div class="chip team-blue">
-          <span class="label">Team</span>
-          <span>BLUE</span>
-        </div>
-        <div class="chip score-chip">
-          <span class="label">First to 5</span>
-          <span><b id="score-blue">0</b> – <i id="score-red">0</i></span>
-        </div>
-        <div class="chip team-blue">
-          <span class="label">Blue</span>
-          <span id="blue-left">5</span>
-        </div>
-        <div class="chip team-red">
-          <span class="label">Red</span>
-          <span id="red-left">5</span>
-        </div>
-        <div class="chip">
-          <span class="label">Painted</span>
-          <span id="elims">0</span>
-        </div>
+      <canvas id="radar" width="256" height="256" aria-hidden="true"></canvas>
+      <div class="scoreline" id="match-score">
+        <div class="pips" id="blue-pips"></div>
+        <b id="score-blue">0</b>
+        <i></i>
+        <b id="score-red">0</b>
+        <div class="pips red" id="red-pips"></div>
       </div>
-      <div class="bottom-bar">
-        <div class="ammo">
-          <span id="ammo">200</span>
-          <small>/ 200</small>
-          <em>MARKER</em>
-        </div>
-        <div id="status" class="status"></div>
+      <div class="scoreline event" id="event-score" hidden>
+        <b id="swarm-size">4</b>
       </div>
+      <div class="ammo-quiet">
+        <em id="gun-name">Glock</em>
+        <span id="ammo">17</span>
+        <b id="nades">1</b>
+      </div>
+      <div id="hp-bar"><i id="hp-fill"></i></div>
+      <div id="use-prompt"></div>
+      <div id="match-clock">3:00</div>
+      <div id="bomb-hud" hidden>
+        <div id="bomb-carry" hidden>C4</div>
+        <div id="bomb-clock" hidden>0:40</div>
+        <div id="bomb-bar" hidden><i></i></div>
+        <div id="bomb-prompt"></div>
+      </div>
+      <div id="toast" class="toast"></div>
       <div id="feed" class="feed"></div>
     </div>
 
     <div id="pause" hidden>
-      <div class="menu-card small">
-        <h2>PAUSED</h2>
-        <p>Click anywhere or hit Resume.</p>
-        <button id="resume" type="button">RESUME</button>
+      <div class="menu-shell slim">
+        <h2>Paused</h2>
+        <button id="resume" type="button">Continue</button>
       </div>
     </div>
 
     <div id="over" hidden>
-      <div class="menu-card">
-        <p class="kicker" id="over-kicker">Match over</p>
-        <h1 id="over-title">WIPED</h1>
+      <div class="menu-shell">
+        <p class="kicker" id="over-kicker"></p>
+        <h1 id="over-title">DEFEAT</h1>
         <p class="tag" id="over-copy"></p>
-        <button id="again" type="button">RUN IT BACK</button>
+        <button id="again" type="button">Again</button>
       </div>
     </div>
 
     <div id="hit-flash"></div>
+    <div id="bomb-flash"></div>
     <div id="paint-vignette"></div>
 
     <script type="module" src="/src/main.js"></script>
