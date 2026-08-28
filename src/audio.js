@@ -1,3 +1,6 @@
+import plantedSfx from "./sfx/bomb-planted.mp3?url";
+import defusedSfx from "./sfx/bomb-defused.mp3?url";
+
 export class AudioEngine {
   constructor() {
     this.ctx = null;
@@ -6,6 +9,13 @@ export class AudioEngine {
   unlock() {
     if (!this.ctx) this.ctx = new AudioContext();
     if (this.ctx.state === "suspended") this.ctx.resume();
+  }
+
+  playFile(url, volume = 0.9) {
+    this.unlock();
+    const a = new Audio(url);
+    a.volume = volume;
+    a.play().catch(() => {});
   }
 
   tone(freq, dur, type = "square", gain = 0.08, slide = 0) {
@@ -43,13 +53,19 @@ export class AudioEngine {
   }
 
   shoot() {
-    this.noise(0.05, 0.1, 1200);
-    this.tone(180, 0.07, "square", 0.05, -80);
+    this.noise(0.07, 0.16, 400);
+    this.tone(90, 0.09, "sawtooth", 0.08, -50);
+    this.tone(220, 0.04, "square", 0.05, -120);
+  }
+
+  impact() {
+    this.noise(0.04, 0.06, 900);
+    this.tone(160, 0.04, "triangle", 0.03, -80);
   }
 
   splat() {
-    this.noise(0.12, 0.14, 400);
-    this.tone(90, 0.1, "sine", 0.06, -40);
+    this.noise(0.1, 0.12, 280);
+    this.tone(110, 0.09, "sine", 0.05, -40);
   }
 
   hit() {
@@ -69,5 +85,32 @@ export class AudioEngine {
   reload() {
     this.tone(220, 0.08, "triangle", 0.05);
     this.tone(160, 0.12, "triangle", 0.04, -20);
+  }
+
+  explode() {
+    this.noise(0.55, 0.28, 80);
+    this.tone(70, 0.4, "sawtooth", 0.16, -40);
+    this.tone(48, 0.55, "sine", 0.12, -20);
+    this.tone(180, 0.18, "square", 0.06, -100);
+  }
+
+  bombBlast() {
+    this.explode();
+    this.noise(1.05, 0.42, 40);
+    this.tone(28, 1.15, "sine", 0.22, -8);
+    this.tone(52, 0.85, "sawtooth", 0.18, -18);
+    this.tone(140, 0.35, "square", 0.08, -70);
+  }
+
+  bombBeep(urgent = false) {
+    this.tone(urgent ? 1040 : 620, 0.045, "square", urgent ? 0.07 : 0.04);
+  }
+
+  plant() {
+    this.playFile(plantedSfx, 0.92);
+  }
+
+  defuse() {
+    this.playFile(defusedSfx, 0.92);
   }
 }

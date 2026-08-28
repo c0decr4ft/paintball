@@ -2,4 +2,9 @@ node_modules
 dist
 .DS_Store
 .verify-*.png
-public/models
+public/models/*
+!public/models/pvp_map.glb
+!public/models/clone_commando.glb
+!public/models/blaster.glb
+!public/models/phoenix.glb
+!public/models/cs_go_bomb.glb
