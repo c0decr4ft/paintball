@@ -7,7 +7,7 @@ function canvas(size, draw) {
   draw(ctx, size);
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
-  tex.anisotropy = 16;
+  tex.anisotropy = 1;
   return tex;
 }
 
@@ -291,11 +291,103 @@ export function woodTexture() {
   return tex;
 }
 
-export function warehouseWallTexture() {
-  return villageWallTexture();
+let _gymWall = null;
+export function gymCourtWallTexture() {
+  if (_gymWall) return _gymWall;
+  const tex = canvas(512, (ctx, s) => {
+    ctx.fillStyle = "#cbb79a";
+    ctx.fillRect(0, 0, s, s);
+    const bw = 64;
+    const bh = 28;
+    const mortar = 3;
+    for (let row = -1; row < s / bh + 2; row++) {
+      const off = (row & 1) * (bw * 0.5);
+      for (let col = -1; col < s / bw + 2; col++) {
+        const x = col * bw + off;
+        const y = row * bh;
+        const n = (row * 17 + col * 11) % 9;
+        const wash = 214 + n;
+        ctx.fillStyle = `rgb(${wash + 6},${wash - 4},${wash - 22})`;
+        ctx.fillRect(x + mortar, y + mortar, bw - mortar * 2, bh - mortar * 2);
+        if ((row * 7 + col * 13) % 11 === 0) {
+          ctx.fillStyle = "rgba(168, 92, 62, 0.32)";
+          ctx.fillRect(x + mortar + 6, y + mortar + 4, bw * 0.38, bh - mortar * 2 - 8);
+        } else if ((row + col) % 8 === 0) {
+          ctx.fillStyle = "rgba(255, 248, 236, 0.22)";
+          ctx.fillRect(x + mortar + 2, y + mortar + 2, bw - mortar * 2 - 4, 4);
+        }
+      }
+    }
+    ctx.globalAlpha = 0.28;
+    ctx.fillStyle = "#e8dcc4";
+    ctx.fillRect(0, 0, s, s);
+    ctx.globalAlpha = 0.12;
+    for (let i = 0; i < 70; i++) {
+      const g = 190 + Math.random() * 40;
+      ctx.fillStyle = `rgb(${g + 8},${g},${g - 18})`;
+      ctx.fillRect(Math.random() * s, Math.random() * s, 18 + Math.random() * 70, 8 + Math.random() * 22);
+    }
+    ctx.globalAlpha = 0.1;
+    ctx.fillStyle = "#6a5340";
+    for (let i = 0; i < 18; i++) {
+      ctx.fillRect(Math.random() * s, Math.random() * s, 1, 12 + Math.random() * 28);
+    }
+    ctx.globalAlpha = 0.12;
+    ctx.fillStyle = "#8a7060";
+    for (let i = 0; i < 14; i++) {
+      ctx.fillRect(Math.random() * s, Math.random() * s, 30 + Math.random() * 90, 10 + Math.random() * 24);
+    }
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#b6a48c";
+    ctx.fillRect(0, 0, 5, s);
+    ctx.fillRect(s - 5, 0, 5, s);
+    ctx.fillRect(s * 0.5 - 2, 0, 4, s);
+  });
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.anisotropy = 2;
+  _gymWall = tex;
+  return tex;
 }
 
+let _gymFloor = null;
+export function gymCourtFloorTexture() {
+  if (_gymFloor) return _gymFloor;
+  const tex = canvas(512, (ctx, s) => {
+    ctx.fillStyle = "#cfc4b0";
+    ctx.fillRect(0, 0, s, s);
+    const tile = 128;
+    for (let y = 0; y < s; y += tile) {
+      for (let x = 0; x < s; x += tile) {
+        const n = 196 + ((x * 5 + y * 3) % 16);
+        ctx.fillStyle = `rgb(${n + 6},${n},${n - 14})`;
+        ctx.fillRect(x + 3, y + 3, tile - 6, tile - 6);
+        for (let i = 0; i < 28; i++) {
+          const g = n - 10 + Math.random() * 18;
+          ctx.fillStyle = `rgba(${g + 4},${g},${g - 10},0.22)`;
+          ctx.fillRect(x + 8 + Math.random() * (tile - 16), y + 8 + Math.random() * (tile - 16), 5, 3);
+        }
+      }
+    }
+    ctx.fillStyle = "#b4a890";
+    for (let i = 0; i <= s; i += tile) {
+      ctx.fillRect(i, 0, 3, s);
+      ctx.fillRect(0, i, s, 3);
+    }
+  });
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.anisotropy = 2;
+  _gymFloor = tex;
+  return tex;
+}
+
+export function warehouseWallTexture() {
+  return gymCourtWallTexture();
+}
+
+let _villageWall = null;
+
 export function villageWallTexture() {
+  if (_villageWall) return _villageWall;
   const tex = canvas(512, (ctx, s) => {
     ctx.fillStyle = "#6a4a38";
     ctx.fillRect(0, 0, s, s);
@@ -395,88 +487,110 @@ export function villageWallTexture() {
     ctx.fillRect(s * 0.5 - 4, 0, 7, s);
   });
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.anisotropy = 8;
+  tex.anisotropy = 2;
+  _villageWall = tex;
   return tex;
 }
 
+let _pebbleFloor = null;
+
 export function warehouseFloorTexture() {
-  return villageFloorTexture();
+  return gymCourtFloorTexture();
 }
 
+/** Packed pebble gravel — small stones, seamless tile. */
 export function villageFloorTexture() {
+  if (_pebbleFloor) return _pebbleFloor;
   const tex = canvas(512, (ctx, s) => {
     const h = (i, j) => {
       const n = Math.sin(i * 127.1 + j * 311.7) * 43758.5453;
       return n - Math.floor(n);
     };
-    ctx.fillStyle = "#8a7354";
+    ctx.fillStyle = "#5c564c";
     ctx.fillRect(0, 0, s, s);
     const img = ctx.getImageData(0, 0, s, s);
     const d = img.data;
     for (let y = 0; y < s; y++) {
       for (let x = 0; x < s; x++) {
-        const u = (x / s) * Math.PI * 2;
-        const v = (y / s) * Math.PI * 2;
-        const n =
-          0.5 +
-          0.22 * Math.sin(u * 8) * Math.cos(v * 6) +
-          0.16 * Math.sin(u * 18 + v * 4) +
-          0.12 * Math.sin(v * 14);
+        const n = h(x * 0.37, y * 0.41);
         const i = (y * s + x) * 4;
-        d[i] = 136 + n * 36;
-        d[i + 1] = 114 + n * 24;
-        d[i + 2] = 80 + n * 14;
+        d[i] = 88 + n * 28;
+        d[i + 1] = 82 + n * 22;
+        d[i + 2] = 70 + n * 16;
         d[i + 3] = 255;
       }
     }
     ctx.putImageData(img, 0, 0);
 
-    const tw = 64;
-    const th = 48;
-    const drawStone = (cx, cy, col, row) => {
-      const n = h(col + 3, row + 7);
-      const w = tw * (0.72 + n * 0.18);
-      const hh = th * (0.62 + h(row, col) * 0.2);
-      const r = 118 + n * 36;
-      const g = 98 + n * 22;
-      const b = 68 + n * 12;
+    const palettes = [
+      [168, 162, 150],
+      [148, 140, 126],
+      [186, 178, 162],
+      [132, 128, 118],
+      [174, 156, 132],
+      [158, 152, 138],
+      [120, 116, 108],
+      [190, 186, 174],
+    ];
+    const cell = 9;
+    const drawPebble = (cx, cy, rx, ry, rot, rgb, n) => {
       for (const ox of [-s, 0, s]) {
         for (const oy of [-s, 0, s]) {
           const x = cx + ox;
           const y = cy + oy;
-          if (x < -tw || x > s + tw || y < -th || y > s + th) continue;
-          ctx.fillStyle = `rgb(${r | 0},${g | 0},${b | 0})`;
+          if (x < -16 || x > s + 16 || y < -16 || y > s + 16) continue;
+          ctx.save();
+          ctx.translate(x, y);
+          ctx.rotate(rot);
+          ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
           ctx.beginPath();
-          ctx.ellipse(x, y, w * 0.48, hh * 0.48, n * 0.4, 0, Math.PI * 2);
+          ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
           ctx.fill();
-          ctx.strokeStyle = "rgba(62,48,32,0.35)";
-          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = `rgba(${Math.max(0, rgb[0] - 48)},${Math.max(0, rgb[1] - 46)},${Math.max(0, rgb[2] - 40)},0.55)`;
+          ctx.lineWidth = 0.7;
           ctx.stroke();
+          ctx.fillStyle = `rgba(255,255,248,${0.1 + n * 0.12})`;
+          ctx.beginPath();
+          ctx.ellipse(-rx * 0.28, -ry * 0.32, rx * 0.32, ry * 0.22, 0, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
         }
       }
     };
-    for (let row = 0; row < Math.ceil(s / th) + 1; row++) {
-      const off = (row & 1) * (tw * 0.5);
-      for (let col = 0; col < Math.ceil(s / tw) + 1; col++) {
-        drawStone(col * tw + off + tw * 0.5, row * th + th * 0.5, col, row);
+    for (let row = 0; row < s / cell + 1; row++) {
+      for (let col = 0; col < s / cell + 1; col++) {
+        const n = h(col + 3, row + 9);
+        if (n < 0.08) continue;
+        const cx = col * cell + cell * 0.5 + (h(row, col) - 0.5) * cell * 0.62;
+        const cy = row * cell + cell * 0.5 + (h(col + 2, row) - 0.5) * cell * 0.62;
+        const rx = 2.1 + n * 4.4;
+        const ry = 1.7 + h(row, col + 5) * 3.6;
+        const rot = h(col * 3, row * 7) * Math.PI;
+        const pal = palettes[(col * 13 + row * 7) % palettes.length];
+        const shade = 0.82 + n * 0.28;
+        drawPebble(
+          cx,
+          cy,
+          rx,
+          ry,
+          rot,
+          [(pal[0] * shade) | 0, (pal[1] * shade) | 0, (pal[2] * shade) | 0],
+          n
+        );
       }
     }
-    ctx.globalAlpha = 0.12;
-    ctx.fillStyle = "#5a6a3c";
-    for (let i = 0; i < 24; i++) {
-      const x = (h(i, 2) * s) | 0;
-      const y = (h(4, i) * s) | 0;
-      ctx.fillRect(x, y, 8 + (i % 5) * 6, 5);
-    }
-    ctx.globalAlpha = 1;
   });
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.anisotropy = 8;
+  tex.repeat.set(7, 7);
+  tex.anisotropy = 2;
+  _pebbleFloor = tex;
   return tex;
 }
 
+let _fireTex = null;
 export function fireTexture() {
-  return canvas(64, (ctx, s) => {
+  if (_fireTex) return _fireTex;
+  _fireTex = canvas(64, (ctx, s) => {
     ctx.clearRect(0, 0, s, s);
     const g = ctx.createRadialGradient(s * 0.5, s * 0.55, 2, s * 0.5, s * 0.5, s * 0.48);
     g.addColorStop(0, "rgba(255, 248, 210, 1)");
@@ -489,10 +603,13 @@ export function fireTexture() {
     ctx.arc(s * 0.5, s * 0.5, s * 0.48, 0, Math.PI * 2);
     ctx.fill();
   });
+  return _fireTex;
 }
 
+let _dentTex = null;
 export function dentTexture() {
-  return canvas(64, (ctx, s) => {
+  if (_dentTex) return _dentTex;
+  _dentTex = canvas(64, (ctx, s) => {
     ctx.clearRect(0, 0, s, s);
     const g = ctx.createRadialGradient(s * 0.5, s * 0.48, 2, s * 0.5, s * 0.5, s * 0.46);
     g.addColorStop(0, "rgba(18, 16, 14, 0.78)");
@@ -504,14 +621,19 @@ export function dentTexture() {
     ctx.ellipse(s * 0.5, s * 0.5, s * 0.38, s * 0.28, 0.2, 0, Math.PI * 2);
     ctx.fill();
   });
+  return _dentTex;
 }
 
+const _puddleCache = new Map();
 export function puddleTexture(hex) {
+  const key = new THREE.Color(hex).getHex();
+  const hit = _puddleCache.get(key);
+  if (hit) return hit;
   const color = new THREE.Color(hex);
   const r = (color.r * 255) | 0;
   const g = (color.g * 255) | 0;
   const b = (color.b * 255) | 0;
-  return canvas(256, (ctx, s) => {
+  const tex = canvas(128, (ctx, s) => {
     ctx.clearRect(0, 0, s, s);
     const cx = s * 0.5;
     const cy = s * 0.52;
@@ -533,9 +655,12 @@ export function puddleTexture(hex) {
       ctx.fill();
     }
   });
+  _puddleCache.set(key, tex);
+  return tex;
 }
 
-export function splatTexture(hex) {
+const _splatCache = new Map();
+function makeSplat(hex) {
   const color = new THREE.Color(hex);
   return canvas(128, (ctx, s) => {
     ctx.clearRect(0, 0, s, s);
@@ -545,15 +670,15 @@ export function splatTexture(hex) {
       const y = s / 2 + (Math.random() - 0.5) * 50;
       const r = 10 + Math.random() * 28;
       const g = ctx.createRadialGradient(x, y, r * 0.1, x, y, r);
-      g.addColorStop(0, `rgba(${color.r * 255 | 0},${color.g * 255 | 0},${color.b * 255 | 0},0.95)`);
-      g.addColorStop(0.55, `rgba(${color.r * 255 | 0},${color.g * 255 | 0},${color.b * 255 | 0},0.75)`);
-      g.addColorStop(1, `rgba(${color.r * 255 | 0},${color.g * 255 | 0},${color.b * 255 | 0},0)`);
+      g.addColorStop(0, `rgba(${(color.r * 255) | 0},${(color.g * 255) | 0},${(color.b * 255) | 0},0.95)`);
+      g.addColorStop(0.55, `rgba(${(color.r * 255) | 0},${(color.g * 255) | 0},${(color.b * 255) | 0},0.75)`);
+      g.addColorStop(1, `rgba(${(color.r * 255) | 0},${(color.g * 255) | 0},${(color.b * 255) | 0},0)`);
       ctx.fillStyle = g;
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
       ctx.fill();
     }
-    ctx.fillStyle = `rgba(${color.r * 255 | 0},${color.g * 255 | 0},${color.b * 255 | 0},0.85)`;
+    ctx.fillStyle = `rgba(${(color.r * 255) | 0},${(color.g * 255) | 0},${(color.b * 255) | 0},0.85)`;
     for (let i = 0; i < 18; i++) {
       const a = Math.random() * Math.PI * 2;
       const d = 18 + Math.random() * 40;
@@ -569,8 +694,18 @@ export function splatTexture(hex) {
       ctx.moveTo(x, s / 2 + 8);
       ctx.quadraticCurveTo(x + 4, s / 2 + 30, x - 2, s / 2 + 50 + Math.random() * 20);
       ctx.lineWidth = 2 + Math.random() * 3;
-      ctx.strokeStyle = `rgba(${color.r * 255 | 0},${color.g * 255 | 0},${color.b * 255 | 0},0.7)`;
+      ctx.strokeStyle = `rgba(${(color.r * 255) | 0},${(color.g * 255) | 0},${(color.b * 255) | 0},0.7)`;
       ctx.stroke();
     }
   });
+}
+
+export function splatTexture(hex) {
+  const key = new THREE.Color(hex).getHex();
+  let list = _splatCache.get(key);
+  if (!list) {
+    list = [makeSplat(hex), makeSplat(hex), makeSplat(hex)];
+    _splatCache.set(key, list);
+  }
+  return list[(Math.random() * list.length) | 0];
 }

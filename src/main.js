@@ -1,4 +1,5 @@
 import "./style.css";
+import { loadOnlineConfig } from "./net.js";
 import { Game } from "./game.js";
 
 const canvas = document.getElementById("c");
@@ -17,12 +18,17 @@ function showLoadError(err) {
   if (eventBtn) eventBtn.disabled = true;
   const bombBtn = document.getElementById("bomb");
   if (bombBtn) bombBtn.disabled = true;
+  const onlineBtn = document.getElementById("online");
+  if (onlineBtn) onlineBtn.disabled = true;
 }
 
 try {
   game = new Game(canvas);
   if (import.meta.env.DEV) window.game = game;
-  game.init().catch(showLoadError);
+  loadOnlineConfig()
+    .catch(() => null)
+    .then(() => game.init())
+    .catch(showLoadError);
 } catch (err) {
   showLoadError(err);
 }

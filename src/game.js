@@ -1,10 +1,26 @@
 import * as THREE from "three";
 import { AudioEngine } from "./audio.js";
-import { buildArena, COMMANDO_H, createBomb, createFighter, createMarker, loadGameAssets, TEAM } from "./arena.js";
+import {
+  attachWeapon,
+  buildArena,
+  COMMANDO_H,
+  createBomb,
+  createChest,
+  createFighter,
+  createMarker,
+  createWeapon,
+  DEFAULT_WEAPON,
+  getWeapon,
+  loadGameAssets,
+  MAX_HP,
+  pickLootWeapon,
+} from "./arena.js";
+import { NetClient } from "./net.js";
 import { dentTexture, fireTexture, puddleTexture, splatTexture } from "./textures.js";
 
 const AMMO_MAX = 200;
 const TO_WIN = 5;
+const MATCH_TIME = 180;
 const BODY_K = COMMANDO_H / 1.82;
 const EYE = 1.62 * BODY_K;
 const RADIUS = 0.38 * BODY_K;
@@ -15,9 +31,9 @@ const GRAVITY = 26;
 const BALL_SPEED = 128;
 const BALL_GRAVITY = 0;
 const FIRE_RATE = 0.11;
-const MAX_SPLATS = 420;
+const MAX_SPLATS = 96;
 const MAX_BALLS = 48;
-const MAX_DENTS = 80;
+const MAX_DENTS = 36;
 const DENT_LIFE = 10;
 const BLOOD = 0xb41c1c;
 const EVENT_START = 4;
@@ -26,6 +42,13 @@ const BLAST_R = 3.4;
 const FIRE_LIFE = 3;
 const NADE_FUSE = 2.1;
 const BOMB_FUSE = 40;
+
+function stepCadence(speed, runAmt = 0) {
+  const stride = THREE.MathUtils.lerp(0.52, 0.88, THREE.MathUtils.clamp(runAmt, 0, 1));
+  const steps = THREE.MathUtils.clamp(Math.abs(speed) / Math.max(0.4, stride), 2.6, 7.4);
+  return steps * Math.PI;
+}
+
 const PLANT_T = 3.2;
 const DEFUSE_T = 7;
 const SITE_R = 2.15;
@@ -52,6 +75,7 @@ export class Game {
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.28;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.sortObjects = true;
 
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.08, 140);
@@ -95,13 +119,22 @@ export class Game {
     this.marker = null;
     this.playerRig = null;
     this.pos = new THREE.Vector3();
+    this._safePos = new THREE.Vector3();
+    this._hasSafePos = false;
+    this._playerPlanted = false;
+    this._pendingSideSwap = false;
 
     this.blueScore = 0;
     this.redScore = 0;
+    this.matchTime = MATCH_TIME;
+    this._timeUp = false;
     this.roundLock = false;
     this.lives = 1;
+    this.hp = MAX_HP;
+    this.weaponId = DEFAULT_WEAPON;
+    this.chests = [];
     this.elims = 0;
-    this.ammo = AMMO_MAX;
+    this.ammo = getWeapon(DEFAULT_WEAPON).ammo;
     this.grenades = 1;
     this.reloading = 0;
     this.fireCooldown = 0;
@@ -127,6 +160,10 @@ export class Game {
     this._possessAt = 0;
     this.eventMode = false;
     this.bombMode = false;
+    this.netOnline = false;
+    this._netSearching = false;
+    this._netBombSite = "A";
+    this._netCarrierId = "";
     this._bombDetonating = false;
     this.playerTeam = "blue";
     this.swarmPeak = 0;
@@ -135,6 +172,8 @@ export class Game {
     this.thrown = [];
     this.explodeWait = [];
     this._fireTex = null;
+    this._introing = false;
+    this._introT = 0;
 
     this.bind();
     this.resize();
@@ -148,22 +187,31 @@ export class Game {
     if (eventBtn) eventBtn.disabled = true;
     const bombBtn = $("bomb");
     if (bombBtn) bombBtn.disabled = true;
+    const onlineBtn = $("online");
+    if (onlineBtn) onlineBtn.disabled = true;
   }
 
   async init() {
     await loadGameAssets();
     this.arena = buildArena(this.scene);
     this.bakeRadar();
-    this.marker = createMarker();
+    this.marker = createWeapon(DEFAULT_WEAPON);
     this.camera.add(this.marker);
     this.scene.add(this.camera);
-    this.bombMesh = createBomb();
+    try {
+      this.bombMesh = createBomb();
+    } catch {
+      this.bombMesh = new THREE.Group();
+    }
     this.bombMesh.visible = false;
     this.scene.add(this.bombMesh);
     this.playerRig = createFighter(this.playerTeam, true);
     this.scene.add(this.playerRig);
     this._playerClipY = this.playerRig.userData?.fpsClipY ?? this.playerRig.userData?.walkUniforms?.uClipY?.value ?? 1.12;
     this.pos.copy(this.arena.spawnBlue);
+    this._playBg = this.scene.background?.clone?.() || new THREE.Color(0xb8c4a0);
+    this._playFog = this.scene.fog;
+    this._menuBg = new THREE.Color(0x0c0806);
     this.resetMatch(false);
     this.ready = true;
     this.loading = false;
@@ -173,6 +221,8 @@ export class Game {
     if (eventBtn) eventBtn.disabled = false;
     const bombBtn = $("bomb");
     if (bombBtn) bombBtn.disabled = false;
+    const onlineBtn = $("online");
+    if (onlineBtn) onlineBtn.disabled = false;
     const tag = document.querySelector("#menu .tag");
     if (tag) tag.textContent = "";
     if (this.previewMap) {
@@ -190,25 +240,29 @@ export class Game {
     // Paint clears only on a fresh match — rounds keep every splat
     for (const s of this.splats) {
       this.scene.remove(s);
-      s.material?.map?.dispose();
+      s.geometry?.dispose();
       s.material?.dispose();
     }
     this.splats.length = 0;
     for (const d of this.dents) {
       this.scene.remove(d.mesh);
-      d.mesh.material?.map?.dispose();
+      d.mesh.geometry?.dispose();
       d.mesh.material?.dispose();
     }
     this.dents.length = 0;
 
     this.blueScore = 0;
     this.redScore = 0;
+    this.matchTime = MATCH_TIME;
+    this._timeUp = false;
     this.roundLock = false;
     this.lives = 1;
+    this.hp = MAX_HP;
     this.elims = 0;
     this.wave = 1;
     this.swarmPeak = 0;
-    this.ammo = AMMO_MAX;
+    this.weaponId = DEFAULT_WEAPON;
+    this.ammo = getWeapon(DEFAULT_WEAPON).ammo;
     this.grenades = 1;
     this.reloading = 0;
     this.fireCooldown = 0;
@@ -228,6 +282,9 @@ export class Game {
     this.recoil = 0;
     this.ads = 0;
     this.plantAmt = 0;
+    this._playerPlanted = false;
+    this._pendingSideSwap = false;
+    if (this.marker) this.equipWeapon(DEFAULT_WEAPON, true);
     if (playing) this.assignPlayerTeam();
     this.startRound(playing);
     this.syncHud();
@@ -254,22 +311,181 @@ export class Game {
     return this.playerTeam === "red" ? this.arena.spawnRed : this.arena.spawnBlue;
   }
 
+  spawnClear(x, z, y) {
+    if (y == null || this.onRoof(x, z, y)) return false;
+    return !this.blocked(x, z, RADIUS + 0.28, y);
+  }
+
+  botStandClear(x, z, y) {
+    if (y == null || this.onRoof(x, z, y)) return false;
+    if (this.arena.groundAt?.(x, z, y) == null) return false;
+    return !this.blocked(x, z, BOT_R + 0.12, y);
+  }
+
+  placeAtSpawn() {
+    this.pos.copy(this.safePlayerPos(this.playerSpawn()));
+    this.velY = 0;
+    this.onGround = true;
+    this._lastGroundY = this.pos.y;
+  }
+
+  safePlayerPos(from = null) {
+    const origin = (from || this.playerSpawn()).clone();
+    const dropped = this.arena.dropOffRoof?.(origin.x, origin.z, origin.y);
+    if (dropped != null) origin.y = dropped;
+    else {
+      const gy = this.arena.groundAt?.(origin.x, origin.z, origin.y);
+      if (gy != null) origin.y = gy;
+    }
+    this.unstuck(origin);
+    if (this.spawnClear(origin.x, origin.z, origin.y)) return origin;
+
+    let best = null;
+    let bestD = 1e9;
+    for (const w of this.arena.waypoints || []) {
+      if (!this.spawnClear(w.x, w.z, w.y)) continue;
+      const d = (w.x - origin.x) ** 2 + (w.z - origin.z) ** 2;
+      if (d < bestD) {
+        bestD = d;
+        best = w;
+      }
+    }
+    if (best) {
+      origin.copy(best);
+      this.unstuck(origin);
+    }
+    return origin;
+  }
+
+  unstuck(pos) {
+    const r = RADIUS + 0.14;
+    const h = Math.max(this.eyeHeight(), EYE);
+    for (let i = 0; i < 6; i++) this.collide(pos, r, h);
+    const gyHere = this.arena.groundAt?.(pos.x, pos.z, pos.y);
+    if (gyHere != null) pos.y = gyHere;
+    if (this.spawnClear(pos.x, pos.z, pos.y)) return pos;
+
+    const gy0 = pos.y;
+    const ox = pos.x;
+    const oz = pos.z;
+    for (let ring = 1; ring <= 12; ring++) {
+      const rad = ring * 0.38;
+      const steps = 8 + ring * 2;
+      for (let k = 0; k < steps; k++) {
+        const a = (k / steps) * Math.PI * 2 + ring * 0.15;
+        const x = ox + Math.cos(a) * rad;
+        const z = oz + Math.sin(a) * rad;
+        const gy = this.arena.dropOffRoof?.(x, z, gy0) ?? this.arena.groundAt?.(x, z, gy0);
+        if (gy == null || !this.spawnClear(x, z, gy)) continue;
+        pos.set(x, gy, z);
+        this.collide(pos, r, h);
+        const gy2 = this.arena.groundAt?.(pos.x, pos.z, pos.y);
+        if (gy2 != null) pos.y = gy2;
+        return pos;
+      }
+    }
+    return pos;
+  }
+
   enemySpawn() {
     return this.playerTeam === "red" ? this.arena.spawnBlue : this.arena.spawnRed;
   }
 
   assignPlayerTeam() {
+    if (this.netOnline) {
+      const me = this.net?.players?.find((p) => p.id === this.net.myId);
+      const team = me?.team === "red" || me?.team === "blue" ? me.team : this.playerTeam;
+      if (team !== this.playerTeam || !this.playerRig) {
+        this.playerTeam = team;
+        if (this.playerRig) this.scene.remove(this.playerRig);
+        this.playerRig = createFighter(this.playerTeam, true);
+        this.scene.add(this.playerRig);
+        this._playerClipY = this.playerRig.userData?.fpsClipY ?? 1.12 * BODY_K;
+      }
+      return;
+    }
     const forced = this._bootParams?.get("team");
-    this.playerTeam = forced === "red" || forced === "blue" ? forced : Math.random() < 0.5 ? "blue" : "red";
+    const team = forced === "red" || forced === "blue" ? forced : Math.random() < 0.5 ? "blue" : "red";
+    this.setPlayerTeam(team);
+  }
+
+  setPlayerTeam(team) {
+    const next = team === "red" ? "red" : "blue";
+    if (this.playerTeam === next && this.playerRig) {
+      this._playerClipY = this.playerRig.userData?.fpsClipY ?? 1.12 * BODY_K;
+      return;
+    }
+    this.playerTeam = next;
     if (this.playerRig) this.scene.remove(this.playerRig);
     this.playerRig = createFighter(this.playerTeam, true);
     this.scene.add(this.playerRig);
     this._playerClipY = this.playerRig.userData?.fpsClipY ?? 1.12 * BODY_K;
   }
 
+  nearSpawnPad(x, z) {
+    const blue = this.arena?.spawnBlue;
+    const red = this.arena?.spawnRed;
+    const r2 = 7.2 * 7.2;
+    if (blue && (x - blue.x) ** 2 + (z - blue.z) ** 2 < r2) return true;
+    if (red && (x - red.x) ** 2 + (z - red.z) ** 2 < r2) return true;
+    return false;
+  }
+
+  pickSpawnSpots(origin, count, skipSelf = false) {
+    const spots = [];
+    const minSepSq = 2.15 * 2.15;
+    const originIsBlue =
+      origin.distanceToSquared(this.arena.spawnBlue) <= origin.distanceToSquared(this.arena.spawnRed);
+    const consider = (x, z, y) => {
+      if (spots.length >= count) return;
+      const safe = this.safeBotPos(x, z, y);
+      const p = new THREE.Vector3(safe.x, safe.y, safe.z);
+      if (skipSelf && p.distanceToSquared(origin) < 0.36) return;
+      if (this.blocked(safe.x, safe.z, BOT_R + 0.1, safe.y)) return;
+      if (spots.some((s) => s.distanceToSquared(p) < minSepSq)) return;
+      spots.push(p);
+    };
+    const nearby = [...(this.arena.waypoints || [])]
+      .filter((w) => {
+        if (w.distanceToSquared(origin) > 14 * 14) return false;
+        if (this.onRoof(w.x, w.z, w.y)) return false;
+        const toBlue = w.distanceToSquared(this.arena.spawnBlue);
+        const toRed = w.distanceToSquared(this.arena.spawnRed);
+        return originIsBlue ? toBlue <= toRed + 8 : toRed <= toBlue + 8;
+      })
+      .sort((a, b) => a.distanceToSquared(origin) - b.distanceToSquared(origin));
+    for (const w of nearby) {
+      consider(w.x, w.z, w.y);
+      if (spots.length >= count) return spots;
+    }
+    const ring = [
+      [2.2, 1.5],
+      [-2.3, 1.4],
+      [-2.1, -1.6],
+      [2.4, -1.3],
+      [3.0, 0.2],
+      [-3.0, -0.2],
+      [0.3, 2.7],
+      [-0.4, -2.6],
+    ];
+    for (const [dx, dz] of ring) {
+      consider(origin.x + dx, origin.z + dz, origin.y);
+      if (spots.length >= count) return spots;
+    }
+    const fb = this.safeBotPos(origin.x, origin.z, origin.y);
+    for (let i = spots.length; i < count; i++) {
+      const a = i * 1.85 + 0.35;
+      consider(fb.x + Math.cos(a) * 2.05, fb.z + Math.sin(a) * 2.05, fb.y);
+    }
+    while (spots.length < count) spots.push(new THREE.Vector3(fb.x, fb.y, fb.z));
+    return spots;
+  }
+
   startRound(playing = this.state === "play") {
     this.roundLock = false;
     this.clearMenuShot();
+    this.clearChests();
+    this.setMenuStudio(false);
     for (const b of this.balls) this.scene.remove(b.mesh);
     this.balls.length = 0;
     for (const bot of this.bots) this.scene.remove(bot.mesh);
@@ -295,15 +511,15 @@ export class Game {
       if (u?.uClipY) u.uClipY.value = this._playerClipY ?? u.uClipY.value;
     }
     this.lives = 1;
-    this.ammo = AMMO_MAX;
+    this.hp = MAX_HP;
+    this.ammo = getWeapon(this.weaponId || DEFAULT_WEAPON).ammo;
     this.grenades = 1;
     this.reloading = 0;
     this.fireCooldown = 0;
     this.velY = 0;
     this.clearFires();
     this.resetBarrels();
-    if (!this.pos) this.pos = this.playerSpawn().clone();
-    else this.pos.copy(this.playerSpawn());
+    this.placeAtSpawn();
     this.yaw = Math.atan2(-(0 - this.pos.x), -(0 - this.pos.z));
     this.pitch = 0;
     this.walkYaw = this.yaw;
@@ -315,6 +531,10 @@ export class Game {
     this.plantAmt = 0;
     this.buttons.aim = false;
     this.bombBusy = false;
+    this._playerPlanted = false;
+    this._safePos.copy(this.pos);
+    this._lastGroundY = this.pos.y;
+    this._hasSafePos = true;
 
     if (!playing) {
       if (this.playerRig) this.playerRig.visible = false;
@@ -327,38 +547,40 @@ export class Game {
     this.muzzleLight.color.set(0xff9a3a);
     this.muzzleLight.distance = 5;
     this.muzzleLight.intensity = 0;
+    this.spawnChests();
 
-    const pickAround = (origin, count, skipSelf = false) => {
-      const sorted = [...this.arena.waypoints].sort(
-        (a, b) => a.distanceToSquared(origin) - b.distanceToSquared(origin)
-      );
-      const spots = [];
-      for (const w of sorted) {
-        if (this.onRoof(w.x, w.z, w.y)) continue;
-        if (skipSelf && w.distanceToSquared(origin) < 0.36) continue;
-        if (spots.some((s) => s.distanceToSquared(w) < 16)) continue;
-        spots.push(w);
-        if (spots.length >= count) break;
-      }
-      const fb = this.safeBotPos(origin.x, origin.z, origin.y);
-      const fallback = new THREE.Vector3(fb.x, fb.y, fb.z);
-      while (spots.length < count) spots.push(fallback);
-      return spots;
-    };
+    if (this.netOnline) {
+      this.spawnNetRound();
+      this.setupBombRound(playing);
+      this.syncHud();
+      return;
+    }
+
     if (this.eventMode) {
       const enemy = this.enemyTeam();
-      pickAround(this.enemySpawn(), EVENT_START).forEach((w, i) => this.spawnBot(enemy, w.x, w.z, i, w.y));
+      this.pickSpawnSpots(this.enemySpawn(), EVENT_START).forEach((w, i) => this.spawnBot(enemy, w.x, w.z, i, w.y));
       this.swarmPeak = Math.max(this.swarmPeak, this.teamAlive(enemy));
     } else {
       const redN = this.playerTeam === "red" ? 4 : 5;
       const blueN = this.playerTeam === "blue" ? 4 : 5;
-      pickAround(this.arena.spawnRed, redN, this.playerTeam === "red").forEach((w, i) => this.spawnBot("red", w.x, w.z, i, w.y));
-      pickAround(this.arena.spawnBlue, blueN, this.playerTeam === "blue").forEach((w, i) => this.spawnBot("blue", w.x, w.z, i, w.y));
+      this.pickSpawnSpots(this.arena.spawnBlue, blueN, this.playerTeam === "blue").forEach((w, i) =>
+        this.spawnBot("blue", w.x, w.z, i, w.y)
+      );
+      this.pickSpawnSpots(this.arena.spawnRed, redN, this.playerTeam === "red").forEach((w, i) =>
+        this.spawnBot("red", w.x, w.z, i, w.y)
+      );
     }
     for (const bot of this.bots) {
+      bot.mesh.visible = true;
+      bot.pushOut = 8 + Math.random() * 2.5;
+      bot.mode = bot.personality === "flank" ? "flank" : bot.personality === "push" ? "advance" : "roam";
+      bot.holdSpot = null;
+      bot.think = 0;
+      bot.stuck = 0;
       bot.roamTarget = this.pickRoamTarget(bot);
-      bot.roamIn = 5 + Math.random() * 5.5;
+      bot.roamIn = 6 + Math.random() * 4;
       bot.waypoint = this.pickWaypoint(bot, bot.roamTarget);
+      this.nudgeBotOut(bot);
     }
     if (this.eventMode) {
       const rush = this.playerSpawn();
@@ -367,15 +589,52 @@ export class Game {
         if (bot.team !== enemy) continue;
         this.armEventRush(bot, rush);
         bot.waypoint = this.pickWaypoint(bot, rush);
+        this.nudgeBotOut(bot);
       }
     }
     this.setupBombRound(playing);
     this.syncHud();
   }
 
+  spawnNetRound() {
+    this.syncNetSeats();
+  }
+
+  syncNetSeats() {
+    if (!this.netOnline || !this.arena) return;
+    const players = this.net?.players || [];
+    for (const p of players) {
+      if (p.id === this.net.myId) continue;
+      if (this.bots.some((b) => b.netId === p.id)) continue;
+      const ai = this.bots.find((b) => b.alive && b.team === p.team && !b.remote);
+      if (ai) {
+        this.scene.remove(ai.mesh);
+        this.bots.splice(this.bots.indexOf(ai), 1);
+      }
+      const origin = p.team === "red" ? this.arena.spawnRed : this.arena.spawnBlue;
+      const bot = this.spawnBot(p.team, origin.x, origin.z, 0, origin.y);
+      bot.remote = true;
+      bot.netId = p.id;
+      bot.name = p.name;
+      bot.raiseAmt = 1;
+    }
+    for (let i = this.bots.length - 1; i >= 0; i--) {
+      const b = this.bots[i];
+      if (!b.remote || players.some((p) => p.id === b.netId)) continue;
+      this.scene.remove(b.mesh);
+      this.bots.splice(i, 1);
+    }
+    for (let i = this.bots.length - 1; i >= 0; i--) {
+      const b = this.bots[i];
+      if (b.remote || b.netId) continue;
+      this.scene.remove(b.mesh);
+      this.bots.splice(i, 1);
+    }
+  }
+
   spawnBot(team, x, z, lane = 0, y = null) {
-    const color = team === "blue" ? TEAM.blue : TEAM.red;
-    const mesh = createFighter(color);
+    const mesh = createFighter(team === "red" ? "red" : "blue");
+    mesh.visible = true;
     const safe = this.safeBotPos(x, z, y);
     const px = safe.x;
     const pz = safe.z;
@@ -402,7 +661,8 @@ export class Game {
         (Math.random() - 0.5) * hz * 1.7
       ),
       alive: true,
-      hp: 1,
+      hp: MAX_HP,
+      weaponId: pickLootWeapon(),
       yaw: Math.atan2(px, pz),
       vel: new THREE.Vector3(),
       walkPhase: Math.random() * Math.PI * 2,
@@ -410,7 +670,7 @@ export class Game {
       runAmt: 0,
       cooldown: 0.08 + Math.random() * 0.16,
       think: 0.04 + Math.random() * 0.16,
-      maxSpeed: 10.8 + Math.random() * 1.1,
+      maxSpeed: 11.6 + Math.random() * 1.4,
       strafe: laneI % 2 === 0 ? 1 : -1,
       mode: this.eventMode && team === this.enemyTeam() ? "advance" : "roam",
       personality: personalities[laneI % personalities.length],
@@ -422,6 +682,7 @@ export class Game {
       deathY: py,
       roamTarget: null,
       roamIn: 0,
+      pushOut: 8,
       waypoint: this.nearestOpen(new THREE.Vector3(preferredX, py, team === "blue" ? 6 : -6), mesh.position),
       stuck: 0,
       lastPos: mesh.position.clone(),
@@ -432,10 +693,10 @@ export class Game {
       hadLos: false,
       reactIn: 0,
       raiseAmt: 0,
-      reactTime: 0.1 + Math.random() * 0.1,
+      reactTime: 0.14 + Math.random() * 0.18,
       fovCos: 0.4 + Math.random() * 0.16,
-      aimErr: 0.02 + Math.random() * 0.028,
-      trackRate: 16 + Math.random() * 6,
+      aimErr: 0.028 + Math.random() * 0.036,
+      trackRate: 10 + Math.random() * 5,
       noiseX: 0,
       noiseY: 0,
       seeGrace: 0,
@@ -444,7 +705,167 @@ export class Game {
       peekT: Math.random() * 0.4,
       plantAmt: 0,
     });
-    return this.bots[this.bots.length - 1];
+    const spawned = this.bots[this.bots.length - 1];
+    attachWeapon(spawned.mesh, spawned.weaponId);
+    return spawned;
+  }
+
+  nudgeBotOut(bot) {
+    if (!bot?.mesh) return;
+    const pos = bot.mesh.position;
+    const safe = this.safeBotPos(pos.x, pos.z, pos.y);
+    pos.set(safe.x, safe.y, safe.z);
+    bot.lastPos.copy(pos);
+    const goal = bot.waypoint || bot.roamTarget;
+    if (!goal) return;
+    let dx = goal.x - pos.x;
+    let dz = goal.z - pos.z;
+    let len = Math.hypot(dx, dz);
+    if (len < 1.6) {
+      bot.roamTarget = this.pickRoamTarget(bot);
+      bot.waypoint = this.pickWaypoint(bot, bot.roamTarget);
+      const next = bot.waypoint || bot.roamTarget;
+      if (!next) return;
+      dx = next.x - pos.x;
+      dz = next.z - pos.z;
+      len = Math.hypot(dx, dz);
+    }
+    if (len < 0.2) return;
+    bot.vel.set((dx / len) * 5.2, 0, (dz / len) * 5.2);
+  }
+
+  clearChests() {
+    for (const c of this.chests || []) this.scene.remove(c.mesh);
+    this.chests = [];
+  }
+
+  spawnChests() {
+    this.clearChests();
+    if (!this.arena) return;
+    const scored = [];
+    for (const w of this.arena.waypoints || []) {
+      const tuck = this.chestTuck(w);
+      if (!tuck) continue;
+      scored.push(tuck);
+    }
+    scored.sort((a, b) => b.score - a.score);
+    const picked = [];
+    for (const p of scored) {
+      if (picked.length >= 4) break;
+      if (picked.some((q) => (q.x - p.x) ** 2 + (q.z - p.z) ** 2 < 81)) continue;
+      picked.push(p);
+    }
+    if (picked.length < 3) {
+      for (const w of this.arena.waypoints || []) {
+        if (picked.length >= 4) break;
+        if (this.onRoof(w.x, w.z, w.y) || this.nearSpawnPad(w.x, w.z) || this.blocked(w.x, w.z, 0.5, w.y)) continue;
+        if (picked.some((q) => (q.x - w.x) ** 2 + (q.z - w.z) ** 2 < 64)) continue;
+        const gy = this.arena.groundAt?.(w.x, w.z, w.y) ?? w.y;
+        picked.push({ x: w.x, y: gy, z: w.z, yaw: Math.random() * Math.PI * 2 });
+      }
+    }
+    for (const p of picked) {
+      const mesh = createChest();
+      mesh.position.set(p.x, p.y, p.z);
+      mesh.rotation.y = p.yaw;
+      mesh.updateMatrixWorld(true);
+      mesh.userData.worldBox = new THREE.Box3().setFromObject(mesh);
+      this.scene.add(mesh);
+      this.chests.push({ mesh, open: false, weapon: pickLootWeapon() });
+    }
+  }
+
+  chestTuck(w) {
+    if (this.onRoof(w.x, w.z, w.y)) return null;
+    if (this.nearSpawnPad(w.x, w.z)) return null;
+    if (this.blocked(w.x, w.z, 0.48, w.y)) return null;
+    const sites = this.arena?.bombSites || [];
+    for (const s of sites) {
+      const p = s.pos || s;
+      if ((p.x - w.x) ** 2 + (p.z - w.z) ** 2 < 20) return null;
+    }
+    const dirs = [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1],
+      [0.71, 0.71],
+      [-0.71, 0.71],
+      [0.71, -0.71],
+      [-0.71, -0.71],
+    ];
+    let walls = 0;
+    let open = 0;
+    let openX = 0;
+    let openZ = 0;
+    for (const [dx, dz] of dirs) {
+      const x = w.x + dx * 1.2;
+      const z = w.z + dz * 1.2;
+      if (this.blocked(x, z, 0.4, w.y) || this.onRoof(x, z, w.y)) walls += 1;
+      else {
+        open += 1;
+        openX += dx;
+        openZ += dz;
+      }
+    }
+    if (open < 2 || open > 5 || walls < 3) return null;
+    const len = Math.hypot(openX, openZ) || 1;
+    const x = w.x + (openX / len) * 0.38;
+    const z = w.z + (openZ / len) * 0.38;
+    if (this.blocked(x, z, 0.5, w.y)) return null;
+    const gy = this.arena.groundAt?.(x, z, w.y) ?? w.y;
+    if (gy == null || this.onRoof(x, z, gy)) return null;
+    const blue = this.arena.spawnBlue;
+    const red = this.arena.spawnRed;
+    const hide = Math.min(
+      blue ? Math.hypot(x - blue.x, z - blue.z) : 20,
+      red ? Math.hypot(x - red.x, z - red.z) : 20
+    );
+    const score = walls * 5 + (open === 2 ? 8 : open === 3 ? 4 : 0) + hide * 0.22;
+    return { x, y: gy, z, yaw: Math.atan2(openX, openZ), score };
+  }
+
+  nearestChest() {
+    let best = null;
+    let bestD = 1.9;
+    for (const c of this.chests || []) {
+      const p = c.mesh.position;
+      const d = Math.hypot(p.x - this.pos.x, p.z - this.pos.z);
+      if (d < bestD && Math.abs((p.y || 0) - this.pos.y) < 1.5) {
+        best = c;
+        bestD = d;
+      }
+    }
+    return best;
+  }
+
+  lootChest() {
+    if (this.state !== "play" || this.out) return;
+    const c = this.nearestChest();
+    if (!c) return;
+    if (c.open) {
+      this.toast("Empty");
+      return;
+    }
+    c.open = true;
+    const lid = c.mesh.userData?.lid;
+    if (lid) {
+      lid.position.z -= 0.08;
+      lid.rotation.x = -1.2;
+    }
+    this.equipWeapon(c.weapon, true);
+    this.toast(getWeapon(c.weapon).name, 2);
+  }
+
+  equipWeapon(id, fillAmmo = true) {
+    const spec = getWeapon(id);
+    this.weaponId = spec.id;
+    const next = createWeapon(spec.id, false);
+    if (this.marker?.parent) this.marker.parent.remove(this.marker);
+    this.marker = next;
+    if (this.camera) this.camera.add(this.marker);
+    if (fillAmmo) this.ammo = spec.ammo;
+    this.syncHud();
   }
 
   setupBombRound(playing) {
@@ -470,7 +891,7 @@ export class Game {
       this.syncBombHud();
       return;
     }
-    this.bombSiteId = Math.random() < 0.5 ? "A" : "B";
+    this.bombSiteId = this.netOnline && this._netBombSite ? this._netBombSite : Math.random() < 0.5 ? "A" : "B";
     this.bombSite = sites.find((s) => s.id === this.bombSiteId) || sites[0];
     for (const s of sites) {
       s.group.visible = true;
@@ -482,7 +903,18 @@ export class Game {
       this.syncBombHud();
       return;
     }
-    if (this.playerTeam === "red") this.giveBomb("player");
+    if (this.netOnline) {
+      const carrierId = this._netCarrierId;
+      if (carrierId && carrierId === this.net.myId) this.giveBomb("player");
+      else {
+        const remote = this.bots.find((b) => b.netId === carrierId);
+        if (remote) this.giveBomb(remote);
+        else {
+          const t = this.bots.find((b) => b.alive && b.team === "red" && !b.remote);
+          this.giveBomb(t || (this.playerTeam === "red" ? "player" : this.bots.find((b) => b.alive && b.team === "red") || "player"));
+        }
+      }
+    } else if (this.playerTeam === "red") this.giveBomb("player");
     else {
       const t = this.bots.find((b) => b.alive && b.team === "red");
       this.giveBomb(t || "player");
@@ -512,7 +944,7 @@ export class Game {
     this.syncBombHud();
   }
 
-  dropBomb(pos) {
+  dropBomb(pos, fromNet = false) {
     if (!this.bombMode || this.bombPlanted || !this.bombMesh) return;
     this.bombCarrier = null;
     this.bombDropped = true;
@@ -525,6 +957,7 @@ export class Game {
     this.bombMesh.rotation.set(0, Math.random() * Math.PI * 2, 0);
     if (this.bombMesh.userData?.light) this.bombMesh.userData.light.intensity = 0.4;
     this.syncBombHud();
+    if (this.netOnline && !fromNet) this.net.sendDrop(pos.x, gy, pos.z);
   }
 
   plantSiteAt(x, z) {
@@ -542,8 +975,9 @@ export class Game {
     return best;
   }
 
-  plantBomb(pos) {
+  plantBomb(pos, fromNet = false) {
     if (!this.bombMode || this.bombPlanted || this.roundLock) return;
+    if (!fromNet && (this.bombCarrier === "player" || this.bombWorker === "player")) this._playerPlanted = true;
     const site = this.plantSiteAt(pos.x, pos.z) || this.bombSite;
     if (site) {
       this.bombSite = site;
@@ -567,9 +1001,10 @@ export class Game {
     this.feed(`Bomb planted ${this.bombSiteId || ""}`.trim());
     this.audio.plant();
     this.syncBombHud();
+    if (this.netOnline && !fromNet) this.net.sendPlant(pos.x, gy, pos.z, this.bombSiteId);
   }
 
-  defuseBomb() {
+  defuseBomb(fromNet = false) {
     if (!this.bombMode || !this.bombPlanted || this.roundLock) return;
     this.bombPlanted = false;
     this.bombWork = 0;
@@ -580,7 +1015,8 @@ export class Game {
     }
     this.feed("Bomb defused");
     this.audio.defuse();
-    this.endRound("blue");
+    if (this.netOnline && !fromNet) this.net.sendDefuse();
+    if (!this.netOnline || this.net.isHost) this.endRound("blue");
   }
 
   nearXZ(ax, az, bx, bz, r) {
@@ -761,6 +1197,9 @@ export class Game {
     if (bar) bar.hidden = !working;
     if (fill) fill.style.width = `${Math.round(this.bombWork * 100)}%`;
     const prompt = $("bomb-prompt");
+    const use = $("use-prompt");
+    const chest = this.state === "play" && !this.out ? this.nearestChest() : null;
+    const chestHint = chest && !chest.open ? "F / E — Open crate" : chest?.open ? "Empty crate" : "";
     if (prompt) {
       const kind = this.state === "play" ? this.bombInteractKind() : null;
       if (kind === "plant") {
@@ -769,6 +1208,10 @@ export class Game {
       } else if (kind === "defuse") prompt.textContent = "Hold E — Defuse";
       else if (this.bombMode && this.bombDropped && this.playerTeam === "red" && !this.out) prompt.textContent = "Pick up the bomb";
       else prompt.textContent = "";
+    }
+    if (use) {
+      const bombText = prompt?.textContent || "";
+      use.textContent = bombText ? "" : chestHint;
     }
   }
 
@@ -784,6 +1227,7 @@ export class Game {
       "KeyR",
       "KeyG",
       "KeyE",
+      "KeyF",
       "ArrowUp",
       "ArrowDown",
       "ArrowLeft",
@@ -799,6 +1243,8 @@ export class Game {
       if (e.repeat) return;
       if (e.code === "KeyR") this.reload();
       if (e.code === "KeyG") this.throwGrenade();
+      if (e.code === "KeyF") this.lootChest();
+      if (e.code === "KeyE" && !this.bombInteractKind()) this.lootChest();
       if (e.code === "Escape" && this.state === "play") this.pause();
       if (e.code === "Space" && this.state === "play" && this.out && !this.roofDying) this.cycleSpectate();
       this.notePossessKey(e);
@@ -844,19 +1290,23 @@ export class Game {
       e.preventDefault();
       this.eventMode = false;
       this.bombMode = false;
-      this.start();
+      this.beginMatch();
     });
     $("event")?.addEventListener("click", (e) => {
       e.preventDefault();
       this.eventMode = true;
       this.bombMode = false;
-      this.start();
+      this.beginMatch();
     });
     $("bomb")?.addEventListener("click", (e) => {
       e.preventDefault();
       this.eventMode = false;
       this.bombMode = true;
-      this.start();
+      this.beginMatch();
+    });
+    $("online")?.addEventListener("click", (e) => {
+      e.preventDefault();
+      this.quickPlay();
     });
     $("resume").addEventListener("click", (e) => {
       e.preventDefault();
@@ -864,7 +1314,12 @@ export class Game {
     });
     $("again").addEventListener("click", (e) => {
       e.preventDefault();
-      this.start(true);
+      if (this.netOnline) {
+        if (this.net?.isHost) this.net.sendStart();
+        else this.toast("Waiting for host");
+        return;
+      }
+      this.beginMatch(true);
     });
     $("pause").addEventListener("click", (e) => {
       if (e.target.closest("button")) return;
@@ -872,6 +1327,242 @@ export class Game {
     });
 
     this._bootParams = new URLSearchParams(location.search);
+    this.setupNet();
+  }
+
+  setupNet() {
+    this.net = new NetClient({
+      onStatus: (text) => this.setNetStatus(text),
+      onError: (text) => {
+        this._netSearching = false;
+        const onlineBtn = $("online");
+        if (onlineBtn) onlineBtn.disabled = false;
+        this.setNetStatus(text);
+        $("menu").hidden = false;
+        this.toast(text || "Could not join", 2.4, true);
+      },
+      onPing: () => {},
+      onWelcome: (msg) => {
+        this.setNetStatus(msg.room ? `Match ${msg.room}` : "Joining…");
+      },
+      onLobby: (msg) => {
+        if (this.netOnline && this.state === "play") this.syncNetSeats();
+      },
+      onNotice: (text) => this.toast(text, 1.8, true),
+      onBegin: (msg) => this.onNetBegin(msg),
+      onState: (msg) => this.onNetState(msg),
+      onShot: (msg) => this.onNetShot(msg),
+      onKill: (msg) => this.onNetKill(msg),
+      onBotKill: (msg) => this.onNetBotKill(msg),
+      onPlanted: (msg) => this.onNetPlanted(msg),
+      onDefused: (msg) => this.onNetDefused(msg),
+      onDropped: (msg) => this.onNetDropped(msg),
+      onRound: (msg) => this.onNetRound(msg),
+      onOver: (msg) => this.onNetOver(msg),
+      onLeave: (msg) => {
+        if (this.netOnline && msg?.id) {
+          const bot = this.bots.find((b) => b.netId === msg.id);
+          if (bot?.alive) this.paintBot(bot, bot.mesh.position.clone(), null, bot.team === "red" ? "blue" : "red");
+          if (this.state === "play") this.syncNetSeats();
+        }
+      },
+      onDisconnect: () => {
+        this._netSearching = false;
+        const onlineBtn = $("online");
+        if (onlineBtn && this.state === "menu") onlineBtn.disabled = false;
+        if (this.netOnline && this.state === "play") {
+          this.netOnline = false;
+          this.toast("Disconnected");
+        } else if (this.state === "menu") {
+          this.setNetStatus("Disconnected");
+        }
+      },
+    });
+  }
+
+  netPlayerName() {
+    try {
+      const stored = localStorage.getItem("paintfield-name");
+      if (stored?.trim()) return stored.trim().slice(0, 16);
+    } catch {
+      /* ignore */
+    }
+    return "Player";
+  }
+
+  setNetStatus(text) {
+    const tag = document.querySelector("#menu .tag");
+    if (tag) tag.textContent = text || "";
+  }
+
+  quickPlay() {
+    if (!this.ready || this._netSearching) return;
+    this._netSearching = true;
+    const onlineBtn = $("online");
+    if (onlineBtn) onlineBtn.disabled = true;
+    this.setNetStatus("Finding match…");
+    this.net.quickPlay({ name: this.netPlayerName() });
+  }
+
+  onNetBegin(msg) {
+    this._netSearching = false;
+    this.netOnline = true;
+    this.eventMode = false;
+    this.bombMode = msg.mode === "bomb";
+    this._netBombSite = msg.site || "A";
+    this._netCarrierId = msg.carrierId || "";
+    const me = (msg.players || []).find((p) => p.id === this.net.myId);
+    if (me?.team) this.playerTeam = me.team;
+    this.showIntro(() => {
+      this.start(true);
+      if (Number.isFinite(msg.blueScore)) this.blueScore = msg.blueScore;
+      if (Number.isFinite(msg.redScore)) this.redScore = msg.redScore;
+      this.syncHud();
+    });
+  }
+
+  onNetState(msg) {
+    if (!this.netOnline || this.state !== "play") return;
+    for (const p of msg.players || []) {
+      if (p.id === this.net.myId) continue;
+      let bot = this.bots.find((b) => b.netId === p.id);
+      if (!bot && p.team) {
+        const origin = p.team === "red" ? this.arena.spawnRed : this.arena.spawnBlue;
+        bot = this.spawnBot(p.team, p.x ?? origin.x, p.z ?? origin.z, 0, p.y ?? origin.y);
+        bot.remote = true;
+        bot.netId = p.id;
+        bot.name = p.name;
+        bot.raiseAmt = 1;
+      }
+      if (bot) {
+        if (p.name) bot.name = p.name;
+        bot._netPose = p;
+      }
+    }
+  }
+
+  ensureNetBot(snap) {
+    let bot = this.bots.find((b) => !b.remote && b.netI === snap.i);
+    if (!bot) {
+      bot = this.spawnBot(snap.team, snap.x, snap.z, snap.i, snap.y);
+      bot.netI = snap.i;
+      bot.netPuppet = true;
+    }
+    bot._netPose = snap;
+  }
+
+  packNetBots() {
+    return [];
+  }
+
+  applyNetBot(bot, dt) {
+    const pose = bot._netPose;
+    if (!bot.alive) {
+      this.animateDeath(bot, dt);
+      return;
+    }
+    if (pose?.alive === false) {
+      this.paintBot(bot, bot.mesh.position.clone(), null, bot.team === "red" ? "blue" : "red");
+      this.animateDeath(bot, dt);
+      return;
+    }
+    if (!pose) {
+      this.animateBot(bot, dt, false, this.sphereInView(bot.mesh.position.x, bot.mesh.position.y + 0.9, bot.mesh.position.z, 4.6));
+      return;
+    }
+    const p = bot.mesh.position;
+    p.x = THREE.MathUtils.damp(p.x, pose.x, 16, dt);
+    p.z = THREE.MathUtils.damp(p.z, pose.z, 16, dt);
+    p.y = pose.y;
+    bot.yaw = this.lerpAngle(bot.yaw, pose.yaw, Math.min(1, dt * 14));
+    bot.mesh.rotation.y = bot.yaw;
+    bot.walkAmt = pose.walk ?? 0;
+    bot.runAmt = pose.run ?? 0;
+    bot.plantAmt = pose.plant ?? 0;
+    bot.raiseAmt = pose.raise ?? 1;
+    const netSpeed = THREE.MathUtils.lerp(7.2, 11.2, bot.runAmt) * bot.walkAmt;
+    bot.walkPhase = (bot.walkPhase || 0) + dt * stepCadence(netSpeed, bot.runAmt);
+    const draw = this.sphereInView(p.x, p.y + 0.9, p.z, 4.6);
+    if (draw) {
+      const plant = bot.plantAmt || 0;
+      this.animateWalk(
+        bot.mesh,
+        bot.walkAmt * (1 - plant * 0.9),
+        bot.walkPhase,
+        plant * 0.72,
+        bot.runAmt * (1 - plant),
+        (bot.raiseAmt ?? 1) * (1 - plant * 0.85),
+        plant
+      );
+    }
+  }
+
+  onNetShot(msg) {
+    if (!this.netOnline || this.state !== "play" || msg.id === this.net.myId) return;
+    const dir = new THREE.Vector3(msg.dx, msg.dy, msg.dz);
+    if (dir.lengthSq() < 0.0001) return;
+    dir.normalize();
+    this.spawnTracer(new THREE.Vector3(msg.ox, msg.oy, msg.oz), dir, msg.team, msg.id, msg.dmg);
+  }
+
+  onNetKill(msg) {
+    if (!this.netOnline) return;
+    if (msg.id === this.net.myId) {
+      if (!this.out) this.playerHit(this.pos.clone(), null, true);
+      return;
+    }
+    const bot = this.bots.find((b) => b.netId === msg.id);
+    if (bot?.alive) this.paintBot(bot, bot.mesh.position.clone(), null, bot.team === "red" ? "blue" : "red", true);
+    if (msg.byName && msg.name) this.feed(`${msg.byName} splashed ${msg.name}`);
+  }
+
+  onNetBotKill(msg) {
+    if (!this.netOnline) return;
+    const bot = this.bots.find((b) => !b.remote && b.netI === msg.i);
+    if (bot?.alive) this.paintBot(bot, bot.mesh.position.clone(), null, bot.team === "red" ? "blue" : "red", true);
+  }
+
+  onNetPlanted(msg) {
+    if (!this.netOnline || this.bombPlanted) return;
+    this.plantBomb(new THREE.Vector3(msg.x, msg.y, msg.z), true);
+  }
+
+  onNetDefused(msg) {
+    if (!this.netOnline || !this.bombPlanted) return;
+    this.defuseBomb(true);
+  }
+
+  onNetDropped(msg) {
+    if (!this.netOnline || this.bombPlanted) return;
+    this.dropBomb(new THREE.Vector3(msg.x, msg.y, msg.z), true);
+  }
+
+  onNetRound(msg) {
+    if (!this.netOnline) return;
+    this._netBombSite = msg.site || this._netBombSite;
+    this._netCarrierId = msg.carrierId || "";
+    if (this.net.isHost) return;
+    this.roundLock = true;
+    this._bombDetonating = false;
+    this.blueScore = msg.blueScore;
+    this.redScore = msg.redScore;
+    this.syncHud();
+    this.feed(msg.winner === "blue" ? "Police win the round" : "Terrorists win the round");
+    if (this.blueScore >= TO_WIN || this.redScore >= TO_WIN) {
+      setTimeout(() => {
+        if (this.state === "play") this.gameOver((this.playerTeam === "blue" ? this.blueScore : this.redScore) >= TO_WIN);
+      }, 1100);
+      return;
+    }
+    setTimeout(() => {
+      if (this.state === "play") this.startRound();
+    }, 2200);
+  }
+
+  onNetOver(msg) {
+    if (!this.netOnline) return;
+    const won = (this.playerTeam === "blue" ? msg.blueScore : msg.redScore) >= TO_WIN;
+    if (this.state !== "over") this.gameOver(won);
   }
 
   applyBootParams() {
@@ -919,10 +1610,52 @@ export class Game {
     }
   }
 
+  beginMatch(reset = false) {
+    this.showIntro(() => this.start(reset));
+  }
+
+  showIntro(done) {
+    if (!this.ready) return;
+    if (this._introing) return;
+    this._introing = true;
+    this.audio.unlock();
+    $("menu").hidden = true;
+    $("pause").hidden = true;
+    $("over").hidden = true;
+    $("hud").hidden = true;
+    const el = $("intro");
+    if (el) {
+      el.hidden = false;
+      el.style.display = "grid";
+      el.style.background = "#000";
+      el.style.zIndex = "20";
+    }
+    clearTimeout(this._introT);
+    this._introT = setTimeout(() => {
+      this._introing = false;
+      if (el) {
+        el.hidden = true;
+        el.style.display = "";
+      }
+      try {
+        done?.();
+      } catch (err) {
+        console.error("Failed to start match:", err);
+        $("menu").hidden = false;
+      }
+    }, 2400);
+  }
+
   start(reset = false) {
     if (!this.ready) return;
     try {
       this.audio.unlock();
+      const intro = $("intro");
+      if (intro) {
+        intro.hidden = true;
+        intro.style.display = "";
+      }
+      this._introing = false;
       if (reset || this.state === "menu" || this.state === "over") this.resetMatch(true);
       this.state = "play";
       this.clearInput();
@@ -941,6 +1674,7 @@ export class Game {
   }
 
   pause() {
+    if (this.netOnline) return;
     if (this.state !== "play") return;
     this.state = "pause";
     this.clearInput();
@@ -953,16 +1687,20 @@ export class Game {
     $("hud").hidden = true;
     $("over").hidden = false;
     if (this.eventMode) {
-      $("over-kicker").textContent = "";
-      $("over-title").textContent = "Defeat";
+      $("over-kicker").textContent = this._timeUp ? "Time" : "";
+      $("over-title").textContent = won ? "Victory" : "Defeat";
       $("over-copy").textContent = "";
     } else {
-      $("over-kicker").textContent = this.bombMode ? "Bomb" : "";
+      $("over-kicker").textContent = this._timeUp ? "Time" : this.bombMode ? "Bomb" : "";
       $("over-title").textContent = won ? "Victory" : "Defeat";
       $("over-copy").textContent = `${this.blueScore} – ${this.redScore}`;
     }
     if (document.pointerLockElement) document.exitPointerLock();
     this.ensureMenuShot();
+    if (this.netOnline && this.net?.isHost) {
+      const winner = (this.playerTeam === "blue" ? this.blueScore : this.redScore) >= TO_WIN ? this.playerTeam : this.enemyTeam();
+      this.net.sendOver(winner);
+    }
   }
 
   onMouse(e) {
@@ -981,8 +1719,9 @@ export class Game {
   }
 
   reload() {
-    if (this.state !== "play" || this.reloading > 0 || this.ammo >= AMMO_MAX || this.out) return;
-    this.reloading = 1.6;
+    const spec = getWeapon(this.weaponId || DEFAULT_WEAPON);
+    if (this.state !== "play" || this.reloading > 0 || this.ammo >= spec.ammo || this.out) return;
+    this.reloading = spec.reload || 1.5;
     this.audio.reload();
     this.toast("Reloading");
   }
@@ -1024,18 +1763,73 @@ export class Game {
     if (matchScore) matchScore.hidden = Boolean(this.eventMode);
     if (eventScore) eventScore.hidden = !this.eventMode;
     if ($("swarm-size")) $("swarm-size").textContent = String(this.teamAlive(this.enemyTeam()));
-    const blueTotal = this.eventMode ? (this.playerTeam === "blue" ? 1 : Math.max(blueN, 1)) : 5;
-    const redTotal = this.eventMode ? (this.playerTeam === "red" ? 1 : Math.max(redN, 1)) : 5;
+    const people = this.netOnline ? this.net?.players || [] : [];
+    const blueTotal = this.eventMode
+      ? this.playerTeam === "blue"
+        ? 1
+        : Math.max(blueN, 1)
+      : this.netOnline
+        ? Math.max(blueN, people.filter((p) => p.team === "blue").length)
+        : 5;
+    const redTotal = this.eventMode
+      ? this.playerTeam === "red"
+        ? 1
+        : Math.max(redN, 1)
+      : this.netOnline
+        ? Math.max(redN, people.filter((p) => p.team === "red").length)
+        : 5;
     this.setPips("blue-pips", blueN, blueTotal);
     this.setPips("red-pips", redN, redTotal);
     if ($("score-blue")) $("score-blue").textContent = this.blueScore;
     if ($("score-red")) $("score-red").textContent = this.redScore;
     if ($("ammo")) $("ammo").textContent = this.ammo;
+    if ($("gun-name")) $("gun-name").textContent = getWeapon(this.weaponId || DEFAULT_WEAPON).name;
+    const hpFill = $("hp-fill");
+    if (hpFill) hpFill.style.width = `${Math.round((Math.max(0, this.hp) / MAX_HP) * 100)}%`;
     if ($("nades")) {
       $("nades").textContent = this.grenades ? "1" : "0";
       $("nades").classList.toggle("off", this.grenades <= 0);
     }
     this.syncBombHud();
+    this.syncMatchClock();
+  }
+
+  formatClock(seconds) {
+    const t = Math.max(0, Math.ceil(seconds));
+    const m = Math.floor(t / 60);
+    const s = t % 60;
+    return `${m}:${String(s).padStart(2, "0")}`;
+  }
+
+  syncMatchClock() {
+    const el = $("match-clock");
+    if (!el) return;
+    el.textContent = this.formatClock(this.matchTime);
+    el.classList.toggle("urgent", this.matchTime <= 30);
+  }
+
+  updateMatchTimer(dt) {
+    if (this.state !== "play" || this._timeUp) return;
+    this.matchTime = Math.max(0, this.matchTime - dt);
+    this.syncMatchClock();
+    if (this.matchTime > 0) return;
+    this.onMatchTimeUp();
+  }
+
+  onMatchTimeUp() {
+    this._timeUp = true;
+    if (this.eventMode) {
+      this.gameOver(!this.out);
+      return;
+    }
+    let winner = null;
+    if (this.blueScore !== this.redScore) winner = this.blueScore > this.redScore ? "blue" : "red";
+    else {
+      const bN = this.teamAlive("blue");
+      const rN = this.teamAlive("red");
+      if (bN !== rN) winner = bN > rN ? "blue" : "red";
+    }
+    this.gameOver(winner ? winner === this.playerTeam : false);
   }
 
   bakeRadar() {
@@ -1193,52 +1987,53 @@ export class Game {
 
   collide(pos, radius, height) {
     if (this.arena?.meshNav) {
-      const solids = this.arena.nearbyWalls?.(pos.x, pos.z, radius + 0.8) || this.arena.wallMeshes;
-      if (!solids.length) {
-        const box = this.arena.worldBox;
-        const m = 0.6;
-        pos.x = Math.max(box.min.x + m, Math.min(box.max.x - m, pos.x));
-        pos.z = Math.max(box.min.z + m, Math.min(box.max.z - m, pos.z));
-        return;
-      }
-      const ray = this._navRay;
-      const origin = this._colOrigin;
-      const dir = this._colDir;
-      const n = this._colN;
-      const head = Math.max(1.12 * BODY_K, height - 0.08);
-      const heights = height > 1.05 * BODY_K ? [0.48 * BODY_K, head] : [0.48 * BODY_K];
-      for (const h of heights) {
-        const y = pos.y + h;
-        for (let i = 0; i < 4; i++) {
-          const a = (i / 4) * Math.PI * 2;
-          dir.set(Math.cos(a), 0, Math.sin(a));
-          origin.set(pos.x, y, pos.z);
-          ray.set(origin, dir);
-          ray.near = 0;
-          ray.far = radius + 0.12;
-          const hit = ray.intersectObjects(solids, false)[0];
-          if (!hit || hit.object.userData.exploded) continue;
-          const wb = hit.object.userData?.worldBox;
-          if (wb && wb.min.y > y + 0.14) continue;
-          if (hit.face) {
-            n.copy(hit.face.normal).transformDirection(hit.object.matrixWorld).normalize();
-            if (n.y > 0.42) continue;
-            if (n.y > 0.28 && hit.point.y <= pos.y + 0.55) continue;
-            n.y = 0;
-            if (n.lengthSq() < 0.0001) n.copy(dir).negate();
-            else n.normalize();
-          } else {
-            n.copy(dir).negate();
-          }
-          const push = radius + 0.04 - hit.distance;
-          if (push > 0) {
-            pos.x += n.x * push;
-            pos.z += n.z * push;
+      const solids = this.arena.nearbyWalk?.(pos.x, pos.z, radius + 1.2) || this.arena.nearbyWalls?.(pos.x, pos.z, radius + 1.2) || this.arena.wallMeshes;
+      if (solids.length) {
+        const ray = this._navRay;
+        const origin = this._colOrigin;
+        const dir = this._colDir;
+        const n = this._colN;
+        const head = Math.max(1.12 * BODY_K, height - 0.08);
+        const heights = height > 1.05 * BODY_K ? [0.48 * BODY_K, head, height] : [0.48 * BODY_K];
+        for (const h of heights) {
+          const y = pos.y + h;
+          const probeR = h >= height - 0.04 ? radius + 0.12 : radius;
+          for (let i = 0; i < 8; i++) {
+            const a = (i / 8) * Math.PI * 2;
+            dir.set(Math.cos(a), 0, Math.sin(a));
+            origin.set(pos.x, y, pos.z);
+            ray.set(origin, dir);
+            ray.near = 0;
+            ray.far = probeR + 0.14;
+            const hit = ray.intersectObjects(solids, false)[0];
+            if (!hit || hit.object.userData.exploded) continue;
+            const wb = hit.object.userData?.worldBox;
+            if (wb && wb.min.y > y + 0.14) continue;
+            const prop = Boolean(hit.object.userData.propSolid);
+            if (hit.face) {
+              n.copy(hit.face.normal).transformDirection(hit.object.matrixWorld).normalize();
+              if (n.dot(dir) > 0) n.negate();
+              if (!prop && n.y > 0.42) continue;
+              if (!prop && n.y > 0.28 && hit.point.y <= pos.y + 0.55) continue;
+              if (prop && n.y > 0.72) continue;
+              n.y = 0;
+              if (n.lengthSq() < 0.0001) n.copy(dir).negate();
+              else n.normalize();
+            } else {
+              n.copy(dir).negate();
+            }
+            const push = probeR + 0.06 - hit.distance;
+            if (push > 0) {
+              pos.x += n.x * push;
+              pos.z += n.z * push;
+            }
           }
         }
+        this.resolvePropSolid(pos, radius, height, solids);
       }
+      if (this.chests?.length) this.resolvePropSolid(pos, radius, height, this.chests.map((c) => c.mesh));
       const box = this.arena.worldBox;
-      const m = 0.6;
+      const m = 1.15;
       pos.x = Math.max(box.min.x + m, Math.min(box.max.x - m, pos.x));
       pos.z = Math.max(box.min.z + m, Math.min(box.max.z - m, pos.z));
       return;
@@ -1261,8 +2056,43 @@ export class Game {
         pos.z += (dz / d) * push;
       }
     }
-    pos.x = Math.max(-this.arena.halfX + 0.85, Math.min(this.arena.halfX - 0.85, pos.x));
-    pos.z = Math.max(-this.arena.halfZ + 0.85, Math.min(this.arena.halfZ - 0.85, pos.z));
+    pos.x = Math.max(-this.arena.halfX + 1.15, Math.min(this.arena.halfX - 1.15, pos.x));
+    pos.z = Math.max(-this.arena.halfZ + 1.15, Math.min(this.arena.halfZ - 1.15, pos.z));
+  }
+
+  resolvePropSolid(pos, radius, height, solids) {
+    const yMin = pos.y + 0.08;
+    const yMax = pos.y + height;
+    for (let pass = 0; pass < 2; pass++) {
+      for (const mesh of solids) {
+        if (!mesh.userData.propSolid || mesh.userData.exploded) continue;
+        const box = mesh.userData.worldBox;
+        if (!box) continue;
+        if (box.max.y - box.min.y < 0.38) continue;
+        if (yMax < box.min.y + 0.04 || yMin > box.max.y) continue;
+        const cx = Math.max(box.min.x, Math.min(pos.x, box.max.x));
+        const cz = Math.max(box.min.z, Math.min(pos.z, box.max.z));
+        const dx = pos.x - cx;
+        const dz = pos.z - cz;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < 1e-8) {
+          const left = pos.x - box.min.x;
+          const right = box.max.x - pos.x;
+          const south = pos.z - box.min.z;
+          const north = box.max.z - pos.z;
+          const m = Math.min(left, right, south, north);
+          if (m === left) pos.x = box.min.x - radius;
+          else if (m === right) pos.x = box.max.x + radius;
+          else if (m === south) pos.z = box.min.z - radius;
+          else pos.z = box.max.z + radius;
+        } else if (d2 < radius * radius) {
+          const d = Math.sqrt(d2);
+          const push = radius - d;
+          pos.x += (dx / d) * push;
+          pos.z += (dz / d) * push;
+        }
+      }
+    }
   }
 
   blocked(x, z, radius = 0.7, y = 0.9) {
@@ -1275,12 +2105,48 @@ export class Game {
   }
 
   safeBotPos(x, z, y = null) {
-    const hint = Number.isFinite(y) ? y : 0.12;
-    const dropped = this.arena.dropOffRoof?.(x, z, hint);
-    const gy = dropped ?? this.arena.groundAt?.(x, z, hint) ?? (Number.isFinite(y) ? y : 0);
-    if (!this.onRoof(x, z, gy)) return { x, z, y: gy };
-    const open = this.nearestOpen(new THREE.Vector3(x, gy, z), new THREE.Vector3(x, gy, z));
-    return { x: open.x, z: open.z, y: open.y };
+    const pos = new THREE.Vector3(x, Number.isFinite(y) ? y : 0.12, z);
+    const dropped = this.arena.dropOffRoof?.(pos.x, pos.z, pos.y);
+    if (dropped != null) pos.y = dropped;
+    else {
+      const gy = this.arena.groundAt?.(pos.x, pos.z, pos.y);
+      if (gy != null) pos.y = gy;
+    }
+    this.unstuck(pos);
+    if (this.botStandClear(pos.x, pos.z, pos.y)) return { x: pos.x, z: pos.z, y: pos.y };
+    const open = this.nearestOpenAway(pos, pos, 2.4);
+    pos.set(open.x, open.y, open.z);
+    this.unstuck(pos);
+    return { x: pos.x, z: pos.z, y: pos.y };
+  }
+
+  nearestOpenAway(target, from, minDist = 4.2) {
+    const fy = from ? from.y : target.y || 0;
+    const fx = from ? from.x : target.x;
+    const fz = from ? from.z : target.z;
+    const minSq = minDist * minDist;
+    let best = null;
+    let bestD = 1e9;
+    let fallback = null;
+    let fallbackD = -1;
+    for (const w of this.arena.waypoints || []) {
+      if (this.onRoof(w.x, w.z, w.y)) continue;
+      if (Math.abs(w.y - fy) > 1.4) continue;
+      const fromSq = (w.x - fx) ** 2 + (w.z - fz) ** 2;
+      const toSq = (w.x - target.x) ** 2 + (w.z - target.z) ** 2;
+      if (fromSq > fallbackD) {
+        fallbackD = fromSq;
+        fallback = w;
+      }
+      if (fromSq < minSq) continue;
+      if (toSq < bestD) {
+        bestD = toSq;
+        best = w;
+      }
+    }
+    const pick = best || fallback;
+    if (!pick) return (from || target).clone();
+    return pick.clone();
   }
 
   clearPath(ax, az, bx, bz, radius = 0.52, y = 0.9) {
@@ -1346,25 +2212,27 @@ export class Game {
       }
       const toGoal = Math.hypot(w.x - goal.x, w.z - goal.z);
       const toBot = Math.hypot(w.x - px, w.z - pz);
-      if (toBot > 14) continue;
-      const linger = keepMoving && toBot < 2.4 ? 22 : 0;
+      if (toBot > 22) continue;
+      const linger = keepMoving && toBot < 3.4 ? 48 : 0;
       const open = this.clearPath(px, pz, w.x, w.z, 0.5, py + 0.9);
       const here = Math.hypot(goal.x - px, goal.z - pz);
       const progress = here - toGoal;
       const score =
         -toGoal * 0.18 -
-        toBot * 0.12 -
-        crowd * 4.4 -
+        toBot * 0.08 -
+        crowd * 3.2 -
         linger +
         progress * 3.2 +
-        (open ? 18 : -110) +
+        (open ? 22 : -40) +
         Math.random() * 12;
       if (score > bestScore) {
         bestScore = score;
         best = w;
       }
     }
-    return best ? best.clone() : this.nearestOpen(goal, bot.mesh.position);
+    return best && Math.hypot(best.x - px, best.z - pz) > 1.8
+      ? best.clone()
+      : this.nearestOpenAway(goal, bot.mesh.position, keepMoving ? 5.5 : 1.2);
   }
 
   pickRoamTarget(bot) {
@@ -1377,9 +2245,15 @@ export class Game {
     const enemyZ = bot.team === "blue" ? -this.arena.halfZ * 0.45 : this.arena.halfZ * 0.45;
     let best = null;
     let bestScore = -1e9;
+    let far = null;
+    let farD = -1;
     for (const w of pool) {
       const distSelf = Math.hypot(w.x - pos.x, w.z - pos.z);
-      if (distSelf < 3.5) continue;
+      if (distSelf > farD) {
+        farD = distSelf;
+        far = w;
+      }
+      if (distSelf < 6.5) continue;
       const travel = distSelf < 7 ? distSelf * 0.15 : Math.min(24, distSelf) * 0.42;
       let crowd = 0;
       for (const o of others) {
@@ -1402,7 +2276,8 @@ export class Game {
       }
     }
     if (best) return best.clone();
-    return pool[Math.floor(Math.random() * pool.length)].clone();
+    if (far && farD > 2.4) return far.clone();
+    return this.nearestOpenAway(pos, pos, 6);
   }
 
   pickHoldSpot(bot, lookAt) {
@@ -1464,9 +2339,8 @@ export class Game {
   groundY(pos, radius) {
     if (this.arena?.meshNav) {
       const y = this.arena.groundAt(pos.x, pos.z, pos.y, true);
-      if (y == null) return this._lastGroundY ?? pos.y;
-      if (y > pos.y + 0.58) return this._lastGroundY ?? pos.y;
-      this._lastGroundY = y;
+      if (y == null) return null;
+      if (y > pos.y + 0.58) return null;
       return y;
     }
     let gy = 0;
@@ -1486,6 +2360,29 @@ export class Game {
     return gy;
   }
 
+  mapMinY() {
+    const box = this.arena?.worldBox;
+    return (box?.min.y ?? -1) + 0.04;
+  }
+
+  restoreSafePos(pos = this.pos) {
+    if (this._hasSafePos) pos.copy(this._safePos);
+    else pos.copy(this.playerSpawn());
+    this.unstuck(pos);
+    if (this.blocked(pos.x, pos.z, RADIUS * 0.42, pos.y) || this.onRoof(pos.x, pos.z, pos.y)) {
+      pos.copy(this.safePlayerPos(pos));
+    }
+    this.velY = 0;
+    this.onGround = true;
+    this._lastGroundY = pos.y;
+  }
+
+  markSafePos() {
+    this._safePos.copy(this.pos);
+    this._lastGroundY = this.pos.y;
+    this._hasSafePos = true;
+  }
+
   forward() {
     return new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
   }
@@ -1500,7 +2397,8 @@ export class Game {
   }
 
   applyCamera(bobX = 0, bobY = 0) {
-    const fov = THREE.MathUtils.lerp(72, 52, this.ads);
+    const adsFov = this.marker?.userData?.adsFov ?? 48;
+    const fov = THREE.MathUtils.lerp(72, adsFov, this.ads);
     if (Math.abs(this.camera.fov - fov) > 0.04) {
       this.camera.fov = fov;
       this.camera.updateProjectionMatrix();
@@ -1519,6 +2417,7 @@ export class Game {
     const ceil = ceilHere == null ? ceilAhead : ceilAhead == null ? ceilHere : Math.min(ceilHere, ceilAhead);
     if (ceil != null) camY = Math.min(camY, ceil - 0.18);
     this.camera.position.set(this.pos.x + bobX * (1 - this.ads * 0.7), camY, this.pos.z);
+    this.clipCamera();
     this.camera.rotation.set(0, 0, 0);
     this.camera.rotateY(this.yaw);
     this.camera.rotateX(this.pitch);
@@ -1528,10 +2427,84 @@ export class Game {
       this.playerRig.visible = !this.out || this.roofDying || this.roofCorpse;
       const body = this.playerRig.userData.body;
       if (body && this.playerRig.userData.fpsView) {
-        body.visible = Boolean(this.roofDying || this.roofCorpse);
+        body.visible = Boolean(this.out || this.roofDying || this.roofCorpse);
       }
       this.applyPlayerClip();
     }
+  }
+
+  clipCamera() {
+    const cam = this.camera.position;
+    const pad = 0.22;
+    let solids = this.arena.nearbyWalls?.(cam.x, cam.z, 2.2) || this.arena.wallMeshes;
+    if (!solids?.length && !this.chests?.length) return;
+    if (this.chests?.length) {
+      solids = solids ? solids.slice() : [];
+      for (const c of this.chests) if (c.mesh) solids.push(c.mesh);
+    }
+    if (!solids?.length) return;
+    const ray = this._navRay;
+    const origin = this._colOrigin;
+    const dir = this._colDir;
+    const n = this._colN;
+    const skip = (hit) => !hit || hit.object.userData.exploded;
+
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2;
+        dir.set(Math.cos(a), 0, Math.sin(a));
+        origin.copy(cam);
+        ray.set(origin, dir);
+        ray.near = 0;
+        ray.far = pad;
+        const hit = ray.intersectObjects(solids, false)[0];
+        if (skip(hit)) continue;
+        if (hit.face) {
+          n.copy(hit.face.normal).transformDirection(hit.object.matrixWorld).normalize();
+          if (n.dot(dir) > 0) n.negate();
+        } else n.copy(dir).negate();
+        n.y = 0;
+        if (n.lengthSq() < 1e-6) continue;
+        n.normalize();
+        const push = pad - hit.distance;
+        if (push > 0) {
+          cam.x += n.x * push;
+          cam.z += n.z * push;
+        }
+      }
+    }
+
+    const look = this.lookDir();
+    origin.copy(cam);
+    ray.set(origin, look);
+    ray.near = 0;
+    ray.far = pad;
+    const lookHit = ray.intersectObjects(solids, false)[0];
+    if (!skip(lookHit)) {
+      if (lookHit.face) {
+        n.copy(lookHit.face.normal).transformDirection(lookHit.object.matrixWorld).normalize();
+        if (n.dot(look) > 0) n.negate();
+      } else n.copy(look).negate();
+      const push = pad - lookHit.distance;
+      if (push > 0) cam.addScaledVector(n, push);
+    }
+
+    origin.set(this.pos.x, this.pos.y + 0.62 * BODY_K, this.pos.z);
+    dir.subVectors(cam, origin);
+    const dist = dir.length();
+    if (dist > 0.03) {
+      dir.multiplyScalar(1 / dist);
+      ray.set(origin, dir);
+      ray.near = 0.02;
+      ray.far = dist;
+      const through = ray.intersectObjects(solids, false)[0];
+      if (!skip(through)) {
+        cam.copy(through.point).addScaledVector(dir, -0.14);
+      }
+    }
+
+    const ceil = this.arena.ceilingAt?.(cam.x, cam.z, this.pos.y + 0.28, 2.6);
+    if (ceil != null) cam.y = Math.min(cam.y, ceil - 0.16);
   }
 
   applyPlayerClip() {
@@ -1550,18 +2523,22 @@ export class Game {
   }
 
   spectateTargets() {
-    return this.bots.filter((b) => b.alive && b.team === this.playerTeam);
+    return this.bots.filter((b) => b.alive && b.mesh && !b.remote && b.team === this.playerTeam);
   }
 
   notePossessKey(e) {
-    if (this.state !== "play" || !this.out || !this.spectating || this.roofDying || this.eventMode) {
+    if (this.state !== "play" || !this.out || this.roofDying || this.eventMode) {
       this._possessBuf = "";
       return;
     }
-    const ch = e.key?.length === 1 ? e.key.toLowerCase() : "";
+    const ch = e.code?.startsWith("Key")
+      ? e.code.slice(3).toLowerCase()
+      : e.key?.length === 1
+        ? e.key.toLowerCase()
+        : "";
     if (!/[a-z]/.test(ch)) return;
     const now = performance.now();
-    if (now - this._possessAt > 2000) this._possessBuf = "";
+    if (now - this._possessAt > 2500) this._possessBuf = "";
     this._possessAt = now;
     const word = "luca";
     const expect = word[this._possessBuf.length];
@@ -1577,9 +2554,14 @@ export class Game {
   }
 
   possessSpectate() {
-    if (this.state !== "play" || !this.out || !this.spectating || this.eventMode) return;
-    const bot = this.spectateTargets()[this.spectateIdx];
+    if (this.state !== "play" || !this.out || this.eventMode) return;
+    const targets = this.spectateTargets();
+    if (!targets.length) return;
+    if (!this.spectating || this.spectateIdx < 0) this.spectateIdx = 0;
+    const bot = targets[this.spectateIdx % targets.length];
     if (!bot?.alive || !bot.mesh) return;
+
+    if (bot.team && bot.team !== this.playerTeam) this.setPlayerTeam(bot.team);
 
     const hadBomb = this.bombMode && this.bombCarrier === bot;
     if (this.bombWorker === bot) {
@@ -1588,13 +2570,17 @@ export class Game {
       this.bombWorkKind = null;
     }
     this.pos.copy(bot.mesh.position);
-    this.yaw = bot.yaw ?? 0;
+    this.unstuck(this.pos);
+    if (this.blocked(this.pos.x, this.pos.z, RADIUS * 0.42, this.pos.y) || this.onRoof(this.pos.x, this.pos.z, this.pos.y)) {
+      this.pos.copy(this.safePlayerPos(this.pos));
+    }
+    this.yaw = bot.yaw ?? bot.mesh.rotation.y ?? 0;
+    this.pitch = 0;
     if (hadBomb) this.giveBomb("player");
 
     this.scene.remove(bot.mesh);
     this.bots = this.bots.filter((b) => b !== bot);
     this.walkYaw = this.yaw;
-    this.pitch = 0;
     this.radarYaw = this.yaw;
     this.velY = 0;
     this.onGround = true;
@@ -1606,8 +2592,9 @@ export class Game {
     this.roofDying = false;
     this.roofCorpse = false;
     this.roofFall = 0;
-    this.ammo = AMMO_MAX;
-    this.grenades = 1;
+    this.equipWeapon(bot.weaponId || DEFAULT_WEAPON, true);
+    this.hp = MAX_HP;
+    this.grenades = bot.grenades > 0 ? 1 : this.grenades;
     this.reloading = 0;
     this.fireCooldown = 0;
     this.crouch = 0;
@@ -1616,11 +2603,17 @@ export class Game {
     this.recoil = 0;
     this.hitFlash = 0;
     this.bombBusy = false;
-    this.walkPhase = 0;
+    this.walkPhase = bot.walkPhase || 0;
     this.walkAmt = 0;
     this.runAmt = 0;
     this.buttons.fire = false;
     this.buttons.aim = false;
+    this.keys.delete("KeyC");
+    this.keys.delete("KeyA");
+    this.keys.delete("KeyD");
+    this.keys.delete("KeyW");
+    this.keys.delete("KeyS");
+    this.markSafePos();
 
     this.marker.visible = true;
     if (!this.camera.children.includes(this.marker)) this.camera.add(this.marker);
@@ -1634,7 +2627,9 @@ export class Game {
       if (u?.uClipY) u.uClipY.value = this._playerClipY ?? u.uClipY.value;
       if (u?.uLookDown) u.uLookDown.value = 0;
       const body = this.playerRig.userData.body;
-      if (body && this.playerRig.userData.fpsView) body.visible = false;
+      if (body && this.playerRig.userData.fpsView) {
+        body.visible = false;
+      }
     }
 
     if (Math.abs(this.camera.fov - 72) > 0.1) {
@@ -1644,6 +2639,8 @@ export class Game {
     this.camera.up.set(0, 1, 0);
     this.syncHud();
     this.applyCamera(0, 0);
+    this.lock();
+    this.toast("Possessed", 1.2);
   }
 
   cycleSpectate() {
@@ -1730,7 +2727,7 @@ export class Game {
         }
       }
       if (closest) {
-        desiredCam.copy(closest.point).addScaledVector(ray.ray.direction, -0.4);
+        desiredCam.copy(closest.point).addScaledVector(ray.ray.direction, -0.55);
         desiredCam.y = Math.max(desiredCam.y, from.y + 0.1);
         if (ceilY != null) desiredCam.y = Math.min(desiredCam.y, ceilY - 0.18);
       }
@@ -1773,7 +2770,7 @@ export class Game {
     this.marker.visible = true;
     const xhair = document.querySelector(".crosshair");
     this.ads = THREE.MathUtils.damp(this.ads, this.buttons.aim && !this.reloading && !this.bombBusy ? 1 : 0, 11, dt);
-    if (xhair) xhair.style.opacity = String(0.78 * (1 - this.ads * 0.92));
+    if (xhair) xhair.style.opacity = String(0.82 * Math.max(0, 1 - this.ads * 1.15));
     this.crouch = THREE.MathUtils.damp(this.crouch, this.keys.has("KeyC") || this.bombBusy ? 1 : 0, 9, dt);
     this.plantAmt = THREE.MathUtils.damp(this.plantAmt || 0, this.bombBusy ? 1 : 0, 10, dt);
     const sprint = (this.keys.has("ShiftLeft") || this.keys.has("ShiftRight")) && this.crouch < 0.35 && this.ads < 0.4 && !this.bombBusy;
@@ -1795,39 +2792,61 @@ export class Game {
     this.pos.add(wish);
     const preMove = this.pos.clone();
     this.collide(this.pos, RADIUS, this.eyeHeight());
-    if (this.arena?.meshNav && this.arena.groundAt(this.pos.x, this.pos.z, this.pos.y, true) == null) {
-      this.pos.x = preMove.x - wish.x;
-      this.pos.z = preMove.z - wish.z;
-      this.collide(this.pos, RADIUS, this.eyeHeight());
+    if (this.arena?.meshNav) {
+      const gyHere = this.arena.groundAt(this.pos.x, this.pos.z, this.pos.y, true);
+      const droppedOff = gyHere == null || (wasGrounded && gyHere < preMove.y - 1.45);
+      if (droppedOff) {
+        this.pos.x = preMove.x - wish.x;
+        this.pos.z = preMove.z - wish.z;
+        this.collide(this.pos, RADIUS, this.eyeHeight());
+      }
+      if (this.blocked(this.pos.x, this.pos.z, RADIUS * 0.42, this.pos.y)) {
+        this.unstuck(this.pos);
+      }
     }
 
     this.velY -= GRAVITY * dt;
     this.pos.y += this.velY * dt;
     const gy = this.groundY(this.pos, RADIUS);
-    const feetOnSurface = this.pos.y + 0.12 >= gy;
-    if (wasGrounded && this.velY <= 1.2 && gy != null && gy <= this.pos.y + 0.58 && gy >= this.pos.y - 0.28) {
-      this.pos.y = gy;
-      this.velY = 0;
-      this.onGround = true;
-    } else if (this.pos.y <= gy) {
-      this.pos.y = gy;
-      this.velY = 0;
-      this.onGround = true;
+    let feetOnSurface = false;
+    if (gy == null || this.pos.y < this.mapMinY() - 0.8) {
+      this.restoreSafePos();
+      feetOnSurface = true;
+    } else if (wasGrounded && gy < this.pos.y - 2.4 && this.velY <= 1) {
+      this.restoreSafePos();
+      feetOnSurface = true;
     } else {
-      this.onGround = false;
+      feetOnSurface = this.pos.y + 0.12 >= gy;
+      if (wasGrounded && this.velY <= 1.2 && gy <= this.pos.y + 0.58 && gy >= this.pos.y - 0.28) {
+        this.pos.y = gy;
+        this.velY = 0;
+        this.onGround = true;
+      } else if (this.pos.y <= gy) {
+        this.pos.y = gy;
+        this.velY = 0;
+        this.onGround = true;
+      } else {
+        this.onGround = false;
+      }
+      if (this.onGround && feetOnSurface) this.markSafePos();
     }
     const ceil = this.arena.ceilingAt?.(this.pos.x, this.pos.z, this.pos.y + 0.2, 2.4);
     if (ceil != null) {
+      const floorY = gy ?? this._lastGroundY ?? this.pos.y;
       const maxY = ceil - this.eyeHeight() - 0.12;
       if (this.pos.y > maxY) {
-        this.pos.y = Math.max(gy, maxY);
+        this.pos.y = Math.max(floorY, maxY);
         if (this.velY > 0) this.velY = 0;
       }
     }
     if (
       this.onGround &&
       feetOnSurface &&
-      this.arena?.isRooftop?.(this.pos.x, this.pos.z, this.pos.y)
+      this.velY <= 0.2 &&
+      gy != null &&
+      Math.abs(this.pos.y - gy) <= 0.14 &&
+      this.arena?.isRooftop?.(this.pos.x, this.pos.z, this.pos.y) &&
+      !this.nearSpawnPad(this.pos.x, this.pos.z)
     ) {
       this.startPlayerRoofDeath();
       this.updatePlayerRoofDeath(dt);
@@ -1847,7 +2866,7 @@ export class Game {
     }
     this.walkAmt = THREE.MathUtils.damp(this.walkAmt, moving ? 1 : 0, 18, dt);
     this.runAmt = THREE.MathUtils.damp(this.runAmt, moving && sprint ? 1 : 0, 12, dt);
-    const cadence = moving ? THREE.MathUtils.lerp(9.4, 15.4, this.runAmt) : 8;
+    const cadence = moving ? stepCadence(speed, this.runAmt) : 8;
     this.walkPhase += dt * cadence * this.walkAmt;
     this.animateWalk(this.playerRig, this.walkAmt, this.walkPhase, this.crouch, this.runAmt, 1, this.plantAmt);
 
@@ -1867,21 +2886,22 @@ export class Game {
     const gunSurge = Math.cos(ph * 2) * THREE.MathUtils.lerp(0.006, 0.016, run) * loc;
     const gunRoll = Math.sin(ph) * THREE.MathUtils.lerp(0.022, 0.048, run) * loc;
     const gunPitch = Math.abs(Math.sin(ph)) * THREE.MathUtils.lerp(0.018, 0.034, run) * loc;
-    const hipX = 0.32 + bobX * 0.4 + gunStrafe;
-    const hipY = -0.26 - this.recoil + gunLift;
-    const hipZ = -0.5 + this.recoil * 0.8 + gunSurge;
-    const adsX = 0.012;
-    const adsY = -0.15 - this.recoil * 0.45;
-    const adsZ = -0.4 + this.recoil * 0.35;
+    const hipX = 0.24 + bobX * 0.35 + gunStrafe;
+    const hipY = -0.2 - this.recoil * 0.55 + gunLift;
+    const hipZ = -0.42 + this.recoil * 0.35 + gunSurge;
+    const sight = this.marker.userData?.sight || new THREE.Vector3(0, 0.05, 0.08);
+    const adsX = -sight.x;
+    const adsY = -sight.y - this.recoil * 0.12;
+    const adsZ = -sight.z - 0.028 + this.recoil * 0.08;
     this.marker.position.set(
       THREE.MathUtils.lerp(hipX, adsX, this.ads),
       THREE.MathUtils.lerp(hipY, adsY, this.ads),
       THREE.MathUtils.lerp(hipZ, adsZ, this.ads)
     );
     this.marker.rotation.set(
-      THREE.MathUtils.lerp(0.06 + this.recoil * 2.2 + gunPitch, 0.01 + this.recoil * 0.6, this.ads),
-      THREE.MathUtils.lerp(0.16, 0.0, this.ads),
-      THREE.MathUtils.lerp(0.03 + gunRoll, 0.0, this.ads)
+      THREE.MathUtils.lerp(0.05 + this.recoil * 1.6 + gunPitch, this.recoil * 0.35, this.ads),
+      THREE.MathUtils.lerp(0.22, 0, this.ads),
+      THREE.MathUtils.lerp(0.04 + gunRoll, 0, this.ads)
     );
     const plant = this.plantAmt || 0;
     if (plant > 0.01) {
@@ -1898,7 +2918,7 @@ export class Game {
     if (this.reloading > 0) {
       this.reloading -= dt;
       if (this.reloading <= 0) {
-        this.ammo = AMMO_MAX;
+        this.ammo = getWeapon(this.weaponId || DEFAULT_WEAPON).ammo;
         this.toast("");
         this.syncHud();
       }
@@ -1910,6 +2930,7 @@ export class Game {
 
   tryFire() {
     if (this.out || this.reloading > 0 || this.fireCooldown > 0 || this.bombBusy) return;
+    const spec = getWeapon(this.weaponId || DEFAULT_WEAPON);
     if (this.ammo <= 0) {
       this.audio.empty();
       this.fireCooldown = 0.18;
@@ -1917,21 +2938,21 @@ export class Game {
       return;
     }
     this.ammo -= 1;
-    this.fireCooldown = FIRE_RATE;
-    this.recoil = 0.045;
+    this.fireCooldown = spec.fire;
+    this.recoil = spec.recoil ?? 0.04;
     this.audio.shoot();
     this.syncHud();
 
     const dir = this.lookDir();
     const origin = this.camera.position.clone().addScaledVector(dir, 0.28);
-    this.spawnTracer(origin, dir, this.playerTeam);
+    this.spawnTracer(origin, dir, this.playerTeam, null, spec.dmg);
     const muzzle = this.marker.userData.muzzle.clone();
     this.marker.localToWorld(muzzle);
     this.muzzleLight.position.copy(muzzle);
     this.muzzleLight.intensity = 6.5;
   }
 
-  spawnTracer(origin, dir, team) {
+  spawnTracer(origin, dir, team, netFrom = null, dmg = null) {
     if (this.balls.length >= MAX_BALLS) {
       const old = this.balls.shift();
       this.scene.remove(old.mesh);
@@ -1945,13 +2966,19 @@ export class Game {
     const vel = dir.clone().multiplyScalar(BALL_SPEED);
     mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), vel.clone().normalize());
     this.scene.add(mesh);
+    const damage = Number.isFinite(dmg) ? dmg : getWeapon(this.weaponId || DEFAULT_WEAPON).dmg;
     this.balls.push({
       mesh,
       vel,
       team,
       life: 1.15,
+      netFrom,
+      dmg: damage,
     });
     this.alertFromShot(origin, team);
+    if (this.netOnline && !netFrom) {
+      this.net.sendShoot(origin.x, origin.y, origin.z, dir.x, dir.y, dir.z, team, damage);
+    }
   }
 
   pingCombat(bot, heardPos) {
@@ -2024,7 +3051,7 @@ export class Game {
             false
           )
           .filter((h) => !h.object.userData.exploded);
-        // Prefer a red canister when a batched wall collider sits a few cm in front of it.
+        // Prefer a crate/barrel when a batched wall collider sits a few cm in front of it.
         const first = hits[0];
         const explosive = hits.find(
           (h) => h.object.userData.barrel && h.distance <= (first?.distance ?? 0) + 0.55
@@ -2121,7 +3148,7 @@ export class Game {
     while (this.splats.length > MAX_SPLATS) {
       const old = this.splats.shift();
       this.scene.remove(old);
-      old.material?.map?.dispose();
+      old.geometry?.dispose();
       old.material?.dispose();
     }
     return mesh;
@@ -2147,7 +3174,7 @@ export class Game {
     while (this.splats.length > MAX_SPLATS) {
       const old = this.splats.shift();
       this.scene.remove(old);
-      old.material?.map?.dispose();
+      old.geometry?.dispose();
       old.material?.dispose();
     }
   }
@@ -2175,7 +3202,7 @@ export class Game {
     while (this.dents.length > MAX_DENTS) {
       const old = this.dents.shift();
       this.scene.remove(old.mesh);
-      old.mesh.material?.map?.dispose();
+      old.mesh.geometry?.dispose();
       old.mesh.material?.dispose();
     }
   }
@@ -2189,7 +3216,6 @@ export class Game {
       }
       if (d.life <= 0) {
         this.scene.remove(d.mesh);
-        d.mesh.material?.map?.dispose();
         d.mesh.material?.dispose();
         this.dents.splice(i, 1);
       }
@@ -2285,19 +3311,16 @@ export class Game {
     const bomb = Boolean(opts.bomb);
     const group = new THREE.Group();
     group.position.copy(pos);
-    const light = new THREE.PointLight(0xff5a18, bomb ? 48 : 10, bomb ? 72 : 14);
-    light.position.y = bomb ? 2.4 : 0.6;
-    group.add(light);
     const sprites = [];
     const tex = this.fireTex();
-    const count = bomb ? 36 : 11;
+    const mat = new THREE.SpriteMaterial({
+      map: tex,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    const count = bomb ? 10 : 6;
     for (let i = 0; i < count; i++) {
-      const mat = new THREE.SpriteMaterial({
-        map: tex,
-        transparent: true,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      });
       const s = new THREE.Sprite(mat);
       if (bomb) {
         const r = 2.2 + Math.random() * 14;
@@ -2314,7 +3337,7 @@ export class Game {
     let shock = null;
     if (bomb) {
       shock = new THREE.Mesh(
-        new THREE.SphereGeometry(1, 18, 14),
+        new THREE.SphereGeometry(1, 8, 6),
         new THREE.MeshBasicMaterial({
           color: 0xff7a22,
           transparent: true,
@@ -2330,7 +3353,6 @@ export class Game {
     this.scene.add(group);
     this.fires.push({
       group,
-      light,
       sprites,
       shock,
       bomb,
@@ -2356,10 +3378,6 @@ export class Game {
       f.life -= dt;
       const bomb = Boolean(f.bomb);
       const blast = bomb ? (f.age < 0.55 ? 80 : 0) : f.age < 0.28 ? BLAST_R : 2.35;
-      const flick = 0.75 + Math.sin(f.age * 17) * 0.2;
-      f.light.intensity = bomb
-        ? (f.age < 0.28 ? 90 : 28 * (f.life / 2.4)) * flick
-        : (f.age < 0.2 ? 14 : 5.5 * (f.life / FIRE_LIFE)) * flick;
       const fireSeen = this.state !== "play" || this.sphereInView(f.pos.x, f.pos.y + (bomb ? 4 : 0.8), f.pos.z, bomb ? 28 : 5.2);
       f.group.visible = fireSeen;
       if (fireSeen) {
@@ -2390,11 +3408,11 @@ export class Game {
     const g = new THREE.Group();
     const body = new THREE.Mesh(
       new THREE.SphereGeometry(0.08, 10, 8),
-      new THREE.MeshStandardMaterial({ color: 0x3a4a32, roughness: 0.55, metalness: 0.35 })
+      new THREE.MeshLambertMaterial({ color: 0x3a4a32 })
     );
     const ring = new THREE.Mesh(
       new THREE.TorusGeometry(0.055, 0.012, 6, 10),
-      new THREE.MeshStandardMaterial({ color: 0x8a8f7a, roughness: 0.4, metalness: 0.6 })
+      new THREE.MeshLambertMaterial({ color: 0x8a8f7a })
     );
     ring.position.y = 0.06;
     ring.rotation.x = Math.PI / 2;
@@ -2490,7 +3508,11 @@ export class Game {
         for (const bot of this.bots) {
           if (!bot.alive || bot.team === b.team) continue;
           if (this.ballHitsBot(prev, b.mesh.position, bot)) {
-            this.paintBot(bot, b.mesh.position.clone(), delta.clone().normalize(), b.team);
+            const dead = this.paintBot(bot, b.mesh.position.clone(), delta.clone().normalize(), b.team, false, b.dmg);
+            if (dead && this.netOnline) {
+              if (bot.netId) this.net.sendHit(bot.netId);
+              else if (bot.netI != null) this.net.sendHitBot(bot.netI);
+            }
             hitKind = "bot";
             break;
           }
@@ -2502,7 +3524,8 @@ export class Game {
           new THREE.Vector3(0.7 * BODY_K, this.eyeHeight(), 0.7 * BODY_K)
         );
         if (playerBox.containsPoint(b.mesh.position) || playerBox.containsPoint(prev)) {
-          this.playerHit(b.mesh.position.clone(), delta.clone().normalize());
+          this.playerHit(b.mesh.position.clone(), delta.clone().normalize(), false, b.dmg);
+          if (this.netOnline && this.net.myId) this.net.sendHit(this.net.myId);
           hitKind = "player";
         }
       }
@@ -2545,15 +3568,26 @@ export class Game {
     return false;
   }
 
-  paintBot(bot, point, inbound, byTeam = "blue") {
-    if (!bot.alive) return;
+  paintBot(bot, point, inbound, byTeam = "blue", fromNet = false, dmg = MAX_HP) {
+    if (!bot.alive) return false;
+    const hit = fromNet ? MAX_HP : Number.isFinite(dmg) ? dmg : MAX_HP;
+    bot.hp = (bot.hp ?? MAX_HP) - hit;
+    if (!fromNet && bot.hp > 0) {
+      this.audio.hit();
+      this.pingCombat(bot, point);
+      bot.think = 0;
+      bot.stuck = 0;
+      bot.pushOut = Math.max(bot.pushOut || 0, 2.2);
+      if (bot.mode === "hold" || bot.mode === "roam") bot.mode = "advance";
+      return false;
+    }
     bot.alive = false;
     bot.hp = 0;
     bot.fall = 0.001;
     bot.blood = false;
     bot.deathX = bot.mesh.position.x;
     bot.deathZ = bot.mesh.position.z;
-    if (bot.team !== this.playerTeam) this.elims += 1;
+    if (bot.team !== this.playerTeam && !fromNet) this.elims += 1;
     if (this.bombMode && this.bombCarrier === bot) this.dropBomb(bot.mesh.position);
     if (this.bombWorker === bot) {
       this.bombWorker = null;
@@ -2571,9 +3605,10 @@ export class Game {
 
     if (this.eventMode && bot.team === this.enemyTeam() && byTeam === this.playerTeam) {
       this.splitEventBot(bot);
-      return;
+      return true;
     }
     this.checkRound();
+    return true;
   }
 
   eventPadOffset(i) {
@@ -2584,7 +3619,7 @@ export class Game {
 
   resetLiveBot(bot, x, z, y, fight) {
     bot.alive = true;
-    bot.hp = 1;
+    bot.hp = MAX_HP;
     bot.fall = 0;
     bot.blood = false;
     bot.roofDeath = false;
@@ -2668,10 +3703,21 @@ export class Game {
     this.syncHud();
   }
 
-  playerHit(point, inbound = null) {
+  playerHit(point, inbound = null, fromNet = false, dmg = MAX_HP) {
     if (this.out) return;
+    if (!fromNet) {
+      const hit = Number.isFinite(dmg) ? dmg : MAX_HP;
+      this.hp = Math.max(0, (this.hp ?? MAX_HP) - hit);
+      this.hitFlash = 1;
+      this.audio.hit();
+      $("hit-flash")?.classList.add("on");
+      setTimeout(() => $("hit-flash")?.classList.remove("on"), 180);
+      this.syncHud();
+      if (this.hp > 0) return;
+    }
     this.out = true;
     this.lives = 0;
+    this.hp = 0;
     this.hitFlash = 1;
     this.spectateIdx = 0;
     this.spectating = !this.eventMode;
@@ -2710,37 +3756,67 @@ export class Game {
     return ai + (this.playerTeam === team && !this.out ? 1 : 0);
   }
 
+  netTeamPresent(team) {
+    if (this.playerTeam === team) return true;
+    if ((this.net?.players || []).some((p) => p.team === team)) return true;
+    return this.bots.some((b) => b.remote && b.team === team);
+  }
+
   checkRound() {
     if (this.roundLock || this.state !== "play" || this._bombDetonating) return;
     if (this.eventMode) return;
-    if (this.bombMode) {
-      if (this.bombPlanted) {
-        if (this.teamAlive("blue") <= 0) this.endRound("red");
-        return;
+    if (this.netOnline && !this.net?.isHost) return;
+    const redIn = !this.netOnline || this.netTeamPresent("red");
+    const blueIn = !this.netOnline || this.netTeamPresent("blue");
+    if (this.netOnline && (!redIn || !blueIn)) {
+      const present = redIn ? "red" : blueIn ? "blue" : null;
+      if (present && this.teamAlive(present) <= 0) {
+        this.roundLock = true;
+        setTimeout(() => {
+          if (this.state === "play" && this.netOnline) this.startRound();
+        }, 1800);
       }
-      if (this.teamAlive("red") <= 0) this.endRound("blue");
-      else if (this.teamAlive("blue") <= 0) this.endRound("red");
       return;
     }
-    if (this.teamAlive("red") <= 0) this.endRound("blue");
-    else if (this.teamAlive("blue") <= 0) this.endRound("red");
+    if (this.bombMode) {
+      if (this.bombPlanted) {
+        if (blueIn && this.teamAlive("blue") <= 0) this.endRound("red");
+        return;
+      }
+      if (redIn && this.teamAlive("red") <= 0) this.endRound("blue");
+      else if (blueIn && this.teamAlive("blue") <= 0) this.endRound("red");
+      return;
+    }
+    if (redIn && this.teamAlive("red") <= 0) this.endRound("blue");
+    else if (blueIn && this.teamAlive("blue") <= 0) this.endRound("red");
   }
 
   endRound(winner) {
     if (this.roundLock) return;
+    if (this.netOnline && !this.net?.isHost) return;
     this.roundLock = true;
     this._bombDetonating = false;
     if (winner === "blue") this.blueScore += 1;
     else this.redScore += 1;
     this.syncHud();
+    if (this.netOnline) this.net.sendRound(winner, this.blueScore, this.redScore);
+    const plantWin =
+      this.bombMode && winner === "red" && this._playerPlanted && this.playerTeam === "red" && !this.netOnline;
     if (this.blueScore >= TO_WIN || this.redScore >= TO_WIN) {
       setTimeout(() => {
         if (this.state === "play") this.gameOver((this.playerTeam === "blue" ? this.blueScore : this.redScore) >= TO_WIN);
       }, 1100);
       return;
     }
+    if (plantWin && Math.random() < 0.5) this._pendingSideSwap = true;
     setTimeout(() => {
-      if (this.state === "play") this.startRound();
+      if (this.state !== "play") return;
+      if (this._pendingSideSwap) {
+        this._pendingSideSwap = false;
+        this.setPlayerTeam(this.enemyTeam());
+        this.toast(this.playerTeam === "blue" ? "Sides swapped · Police" : "Sides swapped · Terrorist", 2.4);
+      }
+      this.startRound();
     }, 2200);
   }
 
@@ -2791,10 +3867,10 @@ export class Game {
     const pose = rig.userData.pose;
     if (pose) {
       const fps = rig.userData.fpsClipY != null;
-      const walkLean = fps ? 0.035 : 0.05;
-      const runLean = fps ? 0.1 : 0.2;
+      const walkLean = fps ? 0.018 : 0.022;
+      const runLean = fps ? 0.045 : 0.055;
       const low = fps ? 0 : 1 - up;
-      pose.rotation.x = -(0.03 + THREE.MathUtils.lerp(walkLean, runLean, run) * amt) - low * 0.18 - plantK * 0.52;
+      pose.rotation.x = -(0.02 + THREE.MathUtils.lerp(walkLean, runLean, run) * amt) - low * 0.18 - plantK * 0.52;
     }
   }
 
@@ -2986,7 +4062,7 @@ export class Game {
     const lookZ = -Math.cos(bot.yaw);
     const along = bot.vel.x * lookX + bot.vel.z * lookZ;
     const sign = along < -0.12 ? -1 : 1;
-    const cadence = moving ? THREE.MathUtils.lerp(9.2, 15.2, bot.runAmt) : 8;
+    const cadence = moving ? stepCadence(speed, bot.runAmt) : 8;
     bot.walkPhase += dt * cadence * bot.walkAmt * sign;
     const plant = bot.plantAmt || 0;
     if (draw) {
@@ -3057,12 +4133,21 @@ export class Game {
       return "advance";
     }
     if (this.eventMode && bot.team === this.enemyTeam()) {
+      if ((bot.pushOut || 0) > 0) return "advance";
       if (los && dist < 8) return roll > 0.35 ? "peek" : "strafe";
       if (los && dist < 16) return roll > 0.45 ? "strafe" : roll > 0.2 ? "peek" : "advance";
+      if (!los && roll < 0.28) return "hold";
       return "advance";
     }
     if (!engaged) {
-      if (bot.personality === "wander" && roll < 0.2) return "hold";
+      if ((bot.pushOut || 0) > 0) {
+        if (bot.personality === "flank") return "flank";
+        if (bot.personality === "push") return "advance";
+        return "roam";
+      }
+      if (bot.personality === "wander" && roll < 0.22) return "hold";
+      if (bot.personality === "flank" && roll < 0.5) return "flank";
+      if (bot.personality === "push" && roll < 0.38) return "advance";
       return "roam";
     }
     if (los && dist < 7) {
@@ -3093,6 +4178,14 @@ export class Game {
         continue;
       }
       if (bot.cine) continue;
+      if (this.netOnline && !bot.remote) continue;
+      if (bot.remote || bot.netPuppet) {
+        this.applyNetBot(bot, dt);
+        continue;
+      }
+
+      bot.pushOut = Math.max(0, (bot.pushOut || 0) - dt);
+      if (bot.pushOut > 0 && (bot.mode === "hold" || bot.mode === "peek")) bot.mode = "roam";
 
       bot.cooldown -= dt;
       bot.think -= dt;
@@ -3175,7 +4268,7 @@ export class Game {
           }
           goal.copy(bot.holdSpot);
         } else {
-          goal.copy(bot.roamTarget);
+          goal.copy(bot.roamTarget || pos);
         }
       } else if (!huntPos) {
         goal.copy(bot.roamTarget || pos);
@@ -3253,7 +4346,7 @@ export class Game {
           want.add(side);
         }
       }
-      if (bot.mode === "hold" && Math.hypot(goal.x - pos.x, goal.z - pos.z) < 1.6) {
+      if (bot.mode === "hold" && (bot.pushOut || 0) <= 0 && Math.hypot(goal.x - pos.x, goal.z - pos.z) < 1.6) {
         want.set(0, 0, 0);
       }
       const desired = this.steerDir(pos, want.lengthSq() > 0.01 ? want : new THREE.Vector3(0, 0, bot.team === "blue" ? -1 : 1));
@@ -3276,7 +4369,7 @@ export class Game {
       } else {
         lookTarget = pos.clone().add(desired);
       }
-      const turn = tracking ? (bot.reactIn > 0 ? 14 : bot.trackRate ?? 16) : inFight ? 12 : 7;
+      const turn = tracking ? (bot.reactIn > 0 ? 7.5 : bot.trackRate ?? 12) : inFight ? 10 : 7;
       bot.yaw = this.lerpAngle(
         bot.yaw,
         Math.atan2(-(lookTarget.x - pos.x), -(lookTarget.z - pos.z)),
@@ -3284,7 +4377,7 @@ export class Game {
       );
       bot.mesh.rotation.y = bot.yaw;
 
-      const nearHold = bot.mode === "hold" && Math.hypot(goal.x - pos.x, goal.z - pos.z) < 1.8;
+      const nearHold = (bot.pushOut || 0) <= 0 && bot.mode === "hold" && Math.hypot(goal.x - pos.x, goal.z - pos.z) < 1.8;
       const targetSpeed = nearHold
         ? bot.maxSpeed * 0.12
         : bot.mode === "peek"
@@ -3295,8 +4388,13 @@ export class Game {
               ? bot.maxSpeed * 0.96
               : bot.maxSpeed;
       const accel = 28;
-      bot.vel.x += desired.x * accel * dt;
-      bot.vel.z += desired.z * accel * dt;
+      if (nearHold) {
+        bot.vel.x *= Math.max(0, 1 - dt * 10);
+        bot.vel.z *= Math.max(0, 1 - dt * 10);
+      } else {
+        bot.vel.x += desired.x * accel * dt;
+        bot.vel.z += desired.z * accel * dt;
+      }
       const max = targetSpeed;
       if (bot.vel.length() > max) bot.vel.setLength(max);
 
@@ -3304,9 +4402,12 @@ export class Game {
       const preBot = pos.clone();
       pos.addScaledVector(bot.vel, dt);
       this.collide(pos, BOT_R, BOT_H);
-      if (this.arena?.meshNav && this.arena.groundAt(pos.x, pos.z, pos.y, true) == null) {
-        pos.x = preBot.x;
-        pos.z = preBot.z;
+      if (this.arena?.meshNav) {
+        const gyStep = this.arena.groundAt(pos.x, pos.z, pos.y, true);
+        if (gyStep == null || gyStep < preBot.y - 1.45) {
+          pos.x = preBot.x;
+          pos.z = preBot.z;
+        }
       }
       const pushx = pos.x - intended.x;
       const pushz = pos.z - intended.z;
@@ -3343,9 +4444,30 @@ export class Game {
       }
       this.collide(pos, BOT_R, BOT_H);
       const gy = this.groundY(pos, BOT_R);
+      if (gy == null || pos.y < this.mapMinY() - 0.8) {
+        const safe = this.safeBotPos(preBot.x, preBot.z, preBot.y);
+        pos.set(safe.x, safe.y, safe.z);
+        bot.vel.set(0, 0, 0);
+        bot.stuck += dt;
+        bot.lastPos.copy(pos);
+        if (bot.stuck > 0.16) {
+          bot.stuck = 0;
+          bot.think = 0;
+          bot.pushOut = Math.max(bot.pushOut || 0, 2.5);
+          bot.mode = "roam";
+          bot.roamTarget = this.pickRoamTarget(bot);
+          bot.waypoint = this.pickWaypoint(bot, bot.roamTarget);
+          this.nudgeBotOut(bot);
+        }
+        continue;
+      }
       const feetOnSurface = pos.y + 0.12 >= gy;
       pos.y = gy;
-      if (feetOnSurface && this.arena?.isRooftop?.(pos.x, pos.z, pos.y)) {
+      if (
+        feetOnSurface &&
+        this.arena?.isRooftop?.(pos.x, pos.z, pos.y) &&
+        !this.nearSpawnPad(pos.x, pos.z)
+      ) {
         this.killOnRoof(bot);
         continue;
       }
@@ -3369,6 +4491,7 @@ export class Game {
           bot.waypoint = this.pickWaypoint(bot, bot.roamTarget);
           bot.mode = "roam";
         }
+        this.nudgeBotOut(bot);
       }
 
       const lookX = -Math.sin(bot.yaw);
@@ -3382,12 +4505,13 @@ export class Game {
       }
       const onTarget = aligned > 0.96;
       const raised = (bot.raiseAmt || 0) > 0.68;
-      const canShoot = bot.reactIn <= 0 && raised && tracking && los && dist < 38 && onTarget;
-      if (bot.grenades && canShoot && los && dist > 7 && dist < 17 && bot.cooldown <= 0 && Math.random() < 0.14) {
+      const canShoot = bot.reactIn <= 0 && raised && tracking && dist < 38 && onTarget;
+      if (bot.grenades && !this.netOnline && canShoot && los && dist > 7 && dist < 17 && bot.cooldown <= 0 && Math.random() < 0.14) {
         this.botThrowGrenade(bot, fireAt);
         bot.cooldown = 1.4;
       } else if (canShoot && bot.cooldown <= 0) {
-        bot.cooldown = 0.15 + Math.random() * 0.14;
+        const weap = getWeapon(bot.weaponId || DEFAULT_WEAPON);
+        bot.cooldown = weap.fire * (0.92 + Math.random() * 0.2);
         const gun = bot.mesh.userData.gun;
         const muzzle = new THREE.Vector3();
         if (gun?.userData?.muzzle) {
@@ -3401,12 +4525,18 @@ export class Game {
         aim.x += (Math.random() - 0.5) * spread;
         aim.y += (Math.random() - 0.5) * spread * 0.75;
         aim.normalize();
-        this.spawnTracer(muzzle, aim, bot.team);
+        this.spawnTracer(muzzle, aim, bot.team, null, weap.dmg);
       }
 
-      this.animateBot(bot, dt, bot.vel.length() > 0.22, this.sphereInView(pos.x, pos.y + 0.9, pos.z, 4.6));
+      this.animateBot(
+        bot,
+        dt,
+        bot.vel.length() > 0.22,
+        (bot.pushOut || 0) > 0 || bot.vel.length() > 0.2 || this.sphereInView(pos.x, pos.y + 0.9, pos.z, 4.6)
+      );
     }
     this.bots = this.bots.filter((b) => {
+      if (b.remote || b.netI != null) return true;
       if (b.alive || b.fall <= 4.4) return true;
       if (b.mesh.parent) this.scene.remove(b.mesh);
       return false;
@@ -3440,6 +4570,10 @@ export class Game {
     if (this.state !== "play") return;
     for (const bot of this.bots) {
       if (bot.cine) continue;
+      if ((bot.pushOut || 0) > 0) {
+        bot.mesh.visible = true;
+        continue;
+      }
       const p = bot.mesh.position;
       bot.mesh.visible = this.sphereInView(p.x, p.y + 0.9, p.z, 4.6);
     }
@@ -3459,6 +4593,14 @@ export class Game {
     for (const b of this.balls) {
       const p = b.mesh.position;
       b.mesh.visible = this.sphereInView(p.x, p.y, p.z, 1.6);
+    }
+    for (const s of this.splats) {
+      const p = s.position;
+      s.visible = this.sphereInView(p.x, p.y, p.z, 1.4);
+    }
+    for (const d of this.dents) {
+      const p = d.mesh.position;
+      d.mesh.visible = this.sphereInView(p.x, p.y, p.z, 0.8);
     }
   }
 
@@ -3486,6 +4628,13 @@ export class Game {
       tr.mesh.geometry?.dispose();
       tr.mesh.material?.dispose();
     }
+    for (const flash of shot.flashes || []) {
+      flash.removeFromParent();
+      flash.traverse((obj) => {
+        obj.geometry?.dispose();
+        obj.material?.dispose();
+      });
+    }
     if (shot.flash) {
       shot.flash.removeFromParent();
       shot.flash.traverse((obj) => {
@@ -3493,120 +4642,91 @@ export class Game {
         obj.material?.dispose();
       });
     }
-    if (shot.redBot) {
-      if (shot.redBot.mesh.parent) this.scene.remove(shot.redBot.mesh);
-      this.bots = this.bots.filter((b) => b !== shot.redBot);
+    if (shot.bomb && shot.bomb !== this.bombMesh) {
+      shot.bomb.removeFromParent();
+    }
+    if (shot.light) this.scene.remove(shot.light);
+    for (const bot of [shot.blueBot, shot.redBot]) {
+      if (!bot) continue;
+      if (bot.mesh.parent) this.scene.remove(bot.mesh);
+      this.bots = this.bots.filter((b) => b !== bot);
     }
     this.menuShot = null;
   }
 
-  findMenuPeek() {
-    const wps = this.arena?.waypoints;
-    if (!wps?.length) return null;
-    const blocked = (x, z, y) => this.arena.blockedXZ(x, z, 0.4, y);
-    const ground = (x, z, y) => this.arena.groundAt(x, z, y);
-    const dirs = [
-      { fx: 0, fz: -1, lx: -1, lz: 0 },
-      { fx: 1, fz: 0, lx: 0, lz: -1 },
-      { fx: 0, fz: 1, lx: 1, lz: 0 },
-      { fx: -1, fz: 0, lx: 0, lz: 1 },
-    ];
-    let best = null;
-    let bestScore = -Infinity;
-    const step = Math.max(1, (wps.length / 180) | 0);
-    const chest = 1.22 * BODY_K;
-    for (let wi = 0; wi < wps.length; wi += step) {
-      const wp = wps[wi];
-      for (const d of dirs) {
-        const sides = [
-          { sx: d.lx, sz: d.lz, peek: 0.68 },
-          { sx: -d.lx, sz: -d.lz, peek: -0.68 },
-        ];
-        for (const side of sides) {
-          if (!blocked(wp.x + side.sx * 1.05, wp.z + side.sz * 1.05, wp.y)) continue;
-          if (blocked(wp.x + d.fx * 1.25, wp.z + d.fz * 1.25, wp.y)) continue;
-          const aroundX = wp.x + d.fx * 1.8 + side.sx * 8.6;
-          const aroundZ = wp.z + d.fz * 1.8 + side.sz * 8.6;
-          const ry = ground(aroundX, aroundZ, wp.y);
-          if (ry == null || blocked(aroundX, aroundZ, ry)) continue;
-          const camX = wp.x + d.fx * 0.28 - side.sx * 0.18;
-          const camZ = wp.z + d.fz * 0.28 - side.sz * 0.18;
-          const cy = ground(camX, camZ, wp.y);
-          if (cy == null || blocked(camX, camZ, cy)) continue;
-          const from = new THREE.Vector3(camX, cy + chest, camZ);
-          const to = new THREE.Vector3(aroundX, ry + chest, aroundZ);
-          if (!this.hasLos(from, to)) continue;
-          const dist = from.distanceTo(to);
-          if (dist < 7.4 || dist > 16.5) continue;
-          const centered = 1 / (1 + Math.hypot(wp.x, wp.z) * 0.05);
-          const score = dist * 0.1 + centered * 10;
-          if (score <= bestScore) continue;
-          bestScore = score;
-          best = {
-            cam: new THREE.Vector3(camX, cy, camZ),
-            red: new THREE.Vector3(aroundX, ry, aroundZ),
-          };
-        }
-      }
-    }
-    return best;
+  setMenuStudio(on) {
+    if (this.arena?.world) this.arena.world.visible = true;
+    this.scene.background = this._playBg || new THREE.Color(0xb8c4a0);
+    this.scene.fog = this._playFog ?? this.scene.fog;
+    this.renderer.toneMappingExposure = on ? 1.18 : 1.28;
   }
 
-  ensureMenuShot() {
-    if (this.previewMap || !this.arena || !this.marker) return;
-    this.clearMenuShot();
-    for (const bot of this.bots) bot.mesh.visible = false;
-
-    let peek = this.findMenuPeek();
-    if (!peek) {
-      const cam = this.arena.spawnBlue.clone();
-      const red = this.arena.spawnRed.clone();
-      peek = { cam, red };
+  menuOpenScore(x, z, y) {
+    let n = 0;
+    const r = 2.2;
+    const offs = [
+      [r, 0],
+      [-r, 0],
+      [0, r],
+      [0, -r],
+      [r, r],
+      [r, -r],
+      [-r, r],
+      [-r, -r],
+    ];
+    for (const [dx, dz] of offs) {
+      const gy = this.arena.groundAt?.(x + dx, z + dz, y);
+      if (gy == null || this.onRoof(x + dx, z + dz, gy) || this.blocked(x + dx, z + dz, 0.4, gy)) continue;
+      n++;
     }
+    return n;
+  }
 
-    const aim = peek.red.clone();
-    aim.y += 1.22 * BODY_K;
-    const lookDx = aim.x - peek.cam.x;
-    const lookDy = aim.y - (peek.cam.y + EYE);
-    const lookDz = aim.z - peek.cam.z;
-    this.pos.copy(peek.cam);
-    this.yaw = Math.atan2(-lookDx, -lookDz);
-    this.pitch = Math.atan2(lookDy, Math.hypot(lookDx, lookDz));
-    this.walkYaw = this.yaw;
+  poseMenuBot(bot, yaw, walk = 0.1, crouch = 0) {
+    bot.cine = true;
+    bot.mode = "hold";
+    bot.vel.set(0, 0, 0);
+    bot.yaw = yaw;
+    bot.mesh.rotation.y = yaw;
+    bot.walkAmt = walk;
+    bot.raiseAmt = 1;
+    if (bot.mesh.userData.gun) bot.mesh.userData.gun.visible = true;
+    this.animateWalk(bot.mesh, walk, bot.walkPhase, crouch, 0, 1, 0);
+  }
 
-    const redBot = this.spawnBot("red", peek.red.x, peek.red.z, 0, peek.red.y);
-    redBot.cine = true;
-    redBot.mode = "hold";
-    redBot.vel.set(0, 0, 0);
-    redBot.yaw = Math.atan2(-(peek.cam.x - peek.red.x), -(peek.cam.z - peek.red.z));
-    redBot.mesh.rotation.y = redBot.yaw;
-    redBot.walkAmt = 0.45;
-    this.animateWalk(redBot.mesh, 0.45, 1.2, 0, 0);
+  menuMuzzleWorld(bot, out) {
+    const gun = bot?.mesh?.userData?.gun;
+    const local = gun?.userData?.muzzle;
+    if (gun && local) {
+      gun.updateMatrixWorld(true);
+      out.copy(local);
+      gun.localToWorld(out);
+      return out;
+    }
+    out.copy(bot.mesh.position);
+    out.y += 1.18 * BODY_K;
+    return out;
+  }
 
-    if (this.playerRig) this.playerRig.visible = false;
-    if (!this.camera.children.includes(this.marker)) this.camera.add(this.marker);
-    this.marker.visible = true;
-    this.marker.position.set(0.24, -0.22, -0.46);
-    this.marker.rotation.set(0.1, 0.12, 0.03);
-
-    const flashMat = new THREE.MeshBasicMaterial({
-      color: 0xffe566,
+  makeMenuFlash(color) {
+    const mat = new THREE.MeshBasicMaterial({
+      color,
       transparent: true,
-      opacity: 0.95,
+      opacity: 0.9,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
       side: THREE.DoubleSide,
     });
-    const flash = new THREE.Group();
-    flash.add(new THREE.Mesh(new THREE.PlaneGeometry(0.36, 0.36), flashMat));
-    const streak = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.55), flashMat.clone());
+    const g = new THREE.Group();
+    g.add(new THREE.Mesh(new THREE.PlaneGeometry(0.26, 0.26), mat));
+    const streak = new THREE.Mesh(new THREE.PlaneGeometry(0.1, 0.38), mat.clone());
     streak.rotation.z = Math.PI * 0.5;
-    flash.add(streak);
-    flash.add(
+    g.add(streak);
+    g.add(
       new THREE.Mesh(
-        new THREE.SphereGeometry(0.05, 8, 8),
+        new THREE.SphereGeometry(0.036, 8, 8),
         new THREE.MeshBasicMaterial({
-          color: 0xfff6b8,
+          color: 0xfff2d0,
           transparent: true,
           opacity: 1,
           depthWrite: false,
@@ -3614,51 +4734,224 @@ export class Game {
         })
       )
     );
-    const muzzleLocal = this.marker.userData.muzzle?.clone() || new THREE.Vector3(0, 0, -0.35);
-    flash.position.copy(muzzleLocal);
-    flash.position.z -= 0.03;
-    this.marker.add(flash);
+    return g;
+  }
 
-    this.camera.up.set(0, 1, 0);
-    this.camera.position.set(peek.cam.x, peek.cam.y + EYE, peek.cam.z);
-    this.camera.rotation.set(0, 0, 0);
-    this.camera.rotateY(this.yaw);
-    this.camera.rotateX(this.pitch);
-    this.camera.updateMatrixWorld(true);
-    this.marker.updateMatrixWorld(true);
+  findMenuDuel() {
+    if (this._menuDuel) return this._menuDuel;
+    const wps = this.arena?.waypoints;
+    if (!wps?.length) return null;
+    const dirs = [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1],
+      [0.71, 0.71],
+      [-0.71, 0.71],
+      [0.71, -0.71],
+      [-0.71, -0.71],
+    ];
+    const chest = 1.18 * BODY_K;
+    let best = null;
+    let bestScore = -Infinity;
+    const step = Math.max(1, (wps.length / 55) | 0);
+    for (let wi = 0; wi < wps.length; wi += step) {
+      const blue = wps[wi];
+      if (this.onRoof(blue.x, blue.z, blue.y)) continue;
+      const openB = this.menuOpenScore(blue.x, blue.z, blue.y);
+      if (openB < 4) continue;
+      for (const [dx, dz] of dirs) {
+        const span = 8.8;
+        const rx = blue.x + dx * span;
+        const rz = blue.z + dz * span;
+        const ry = this.arena.groundAt?.(rx, rz, blue.y);
+        if (ry == null || this.blocked(rx, rz, 0.45, ry) || this.onRoof(rx, rz, ry)) continue;
+        const openR = this.menuOpenScore(rx, rz, ry);
+        if (openR < 4) continue;
+        this._losFrom.set(blue.x, blue.y + chest, blue.z);
+        this._losTo.set(rx, ry + chest, rz);
+        if (!this.hasLos(this._losFrom, this._losTo)) continue;
+        const midX = (blue.x + rx) * 0.5;
+        const midZ = (blue.z + rz) * 0.5;
+        const midY = (blue.y + ry) * 0.5;
+        const ax = rx - blue.x;
+        const az = rz - blue.z;
+        const alen = Math.hypot(ax, az) || 1;
+        const nx = -az / alen;
+        const nz = ax / alen;
+        for (const side of [1, -1]) {
+          const camDist = 9.6;
+          const camX = midX + nx * side * camDist - (ax / alen) * 1.2;
+          const camZ = midZ + nz * side * camDist - (az / alen) * 1.2;
+          const cy = this.arena.groundAt?.(camX, camZ, midY);
+          if (cy == null || this.blocked(camX, camZ, 0.5, cy) || this.onRoof(camX, camZ, cy)) continue;
+          const cam = new THREE.Vector3(camX, cy + 1.52, camZ);
+          const look = new THREE.Vector3(midX, midY + 1.08, midZ);
+          this._losFrom.copy(cam);
+          this._losTo.copy(look);
+          if (!this.hasLos(this._losFrom, this._losTo)) continue;
+          this._losTo.set(blue.x, blue.y + chest, blue.z);
+          if (!this.hasLos(this._losFrom, this._losTo)) continue;
+          this._losTo.set(rx, ry + chest, rz);
+          if (!this.hasLos(this._losFrom, this._losTo)) continue;
+          const centered = 1 / (1 + Math.hypot(midX, midZ) * 0.045);
+          const score = (openB + openR) * 0.4 + centered * 8;
+          if (score <= bestScore) continue;
+          bestScore = score;
+          best = {
+            blue: new THREE.Vector3(blue.x, blue.y, blue.z),
+            red: new THREE.Vector3(rx, ry, rz),
+            cam,
+            look,
+            mid: new THREE.Vector3(midX, midY, midZ),
+            axis: new THREE.Vector3(ax / alen, 0, az / alen),
+            perp: new THREE.Vector3(nx * side, 0, nz * side),
+            camDist,
+            camY: cam.y,
+          };
+        }
+      }
+    }
+    this._menuDuel = best;
+    return best;
+  }
 
-    const muzzleWorld = muzzleLocal.clone();
-    this.marker.localToWorld(muzzleWorld);
-    const dir = aim.clone().sub(muzzleWorld);
-    if (dir.lengthSq() < 0.01) dir.set(0, 0, -1);
-    else dir.normalize();
+  ensureMenuShot() {
+    if (this.previewMap || !this.arena) return;
+    this.clearMenuShot();
+    this.setMenuStudio(true);
+    for (const bot of this.bots) bot.mesh.visible = false;
+    if (this.bombMesh) this.bombMesh.visible = false;
 
-    const tracers = [];
-    for (const u of [0.28, 0.46, 0.64]) {
-      const mesh = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.022, 0.008, 0.95, 6),
-        new THREE.MeshBasicMaterial({ color: 0xffe070 })
-      );
-      mesh.position.lerpVectors(muzzleWorld, aim, u);
-      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
-      this.scene.add(mesh);
-      tracers.push({ mesh, u });
+    let duel = this.findMenuDuel();
+    if (!duel) {
+      const blue = this.arena.spawnBlue.clone();
+      const red = this.arena.spawnRed.clone();
+      const span = blue.distanceTo(red);
+      if (span > 11) red.lerp(blue, 1 - 9 / span);
+      const mid = blue.clone().add(red).multiplyScalar(0.5);
+      const axis = red.clone().sub(blue);
+      axis.y = 0;
+      if (axis.lengthSq() < 0.01) axis.set(1, 0, 0);
+      else axis.normalize();
+      const perp = new THREE.Vector3(-axis.z, 0, axis.x);
+      const camDist = 9.6;
+      const cam = mid.clone().addScaledVector(perp, camDist).addScaledVector(axis, -1.2);
+      const gy = this.arena.groundAt(cam.x, cam.z, mid.y);
+      cam.y = (gy ?? mid.y) + 1.52;
+      duel = {
+        blue,
+        red,
+        cam,
+        look: mid.clone().setY(mid.y + 1.08),
+        mid,
+        axis,
+        perp,
+        camDist,
+        camY: cam.y,
+      };
     }
 
-    this.muzzleLight.position.copy(muzzleWorld);
-    this.muzzleLight.distance = 7;
-    this.muzzleLight.intensity = 7.5;
-    this.muzzleLight.color.set(0xffe566);
+    const right = new THREE.Vector3(duel.perp.z, 0, -duel.perp.x);
+    duel.look.addScaledVector(right, -2.2);
+    duel.look.addScaledVector(duel.axis, 0.35);
+
+    this.pos.copy(duel.mid);
+    this.yaw = Math.atan2(-duel.perp.x, -duel.perp.z);
+    this.pitch = -0.12;
+    this.walkYaw = this.yaw;
+
+    const blueBot = this.spawnBot("blue", duel.blue.x, duel.blue.z, 0, duel.blue.y);
+    const redBot = this.spawnBot("red", duel.red.x, duel.red.z, 0, duel.red.y);
+    blueBot.mesh.position.copy(duel.blue);
+    redBot.mesh.position.copy(duel.red);
+    this.poseMenuBot(
+      blueBot,
+      Math.atan2(-(duel.red.x - duel.blue.x), -(duel.red.z - duel.blue.z)),
+      0.08,
+      0.16
+    );
+    this.poseMenuBot(
+      redBot,
+      Math.atan2(-(duel.blue.x - duel.red.x), -(duel.blue.z - duel.red.z)),
+      0.12,
+      0.04
+    );
+
+    if (this.playerRig) this.playerRig.visible = false;
+    if (this.marker) {
+      this.marker.visible = false;
+      this.camera.remove(this.marker);
+    }
+
+    const flashes = [];
+    const blueFlash = this.makeMenuFlash(0x7ad4ff);
+    const redFlash = this.makeMenuFlash(0xff7a3a);
+    const blueGun = blueBot.mesh.userData.gun;
+    const redGun = redBot.mesh.userData.gun;
+    if (blueGun) {
+      blueFlash.position.copy(blueGun.userData.muzzle || new THREE.Vector3(0, 0, -0.3));
+      blueFlash.position.z -= 0.02;
+      blueGun.add(blueFlash);
+      flashes.push(blueFlash);
+    }
+    if (redGun) {
+      redFlash.position.copy(redGun.userData.muzzle || new THREE.Vector3(0, 0, -0.3));
+      redFlash.position.z -= 0.02;
+      redGun.add(redFlash);
+      flashes.push(redFlash);
+    }
+
+    const muzzleA = new THREE.Vector3();
+    const muzzleB = new THREE.Vector3();
+    this.menuMuzzleWorld(blueBot, muzzleA);
+    this.menuMuzzleWorld(redBot, muzzleB);
+    const dir = muzzleB.clone().sub(muzzleA);
+    if (dir.lengthSq() < 0.01) dir.set(0, 0, -1);
+    else dir.normalize();
+    const tracers = [];
+    const specs = [
+      { u: 0.22, color: 0x66d0ff, fromBlue: true },
+      { u: 0.48, color: 0x66d0ff, fromBlue: true },
+      { u: 0.34, color: 0xff6a3a, fromBlue: false },
+      { u: 0.62, color: 0xff6a3a, fromBlue: false },
+    ];
+    for (const spec of specs) {
+      const mesh = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.028, 0.01, 1.05, 6),
+        new THREE.MeshBasicMaterial({ color: spec.color })
+      );
+      const a = spec.fromBlue ? muzzleA : muzzleB;
+      const b = spec.fromBlue ? muzzleB : muzzleA;
+      mesh.position.lerpVectors(a, b, spec.u);
+      mesh.quaternion.setFromUnitVectors(
+        new THREE.Vector3(0, 1, 0),
+        dir.clone().multiplyScalar(spec.fromBlue ? 1 : -1)
+      );
+      this.scene.add(mesh);
+      tracers.push({ mesh, u: spec.u, fromBlue: spec.fromBlue });
+    }
+
+    this.muzzleLight.position.copy(muzzleA);
+    this.muzzleLight.distance = 9;
+    this.muzzleLight.intensity = 2.8;
+    this.muzzleLight.color.set(0xffc48a);
+
+    this.camera.fov = 50;
+    this.camera.updateProjectionMatrix();
+    this.camera.up.set(0, 1, 0);
+    this.camera.position.copy(duel.cam);
+    this.camera.lookAt(duel.look);
 
     this.menuShot = {
-      cam: peek.cam,
-      red: peek.red,
-      yaw: this.yaw,
-      pitch: this.pitch,
-      flash,
+      ...duel,
+      flashes,
       tracers,
+      blueBot,
       redBot,
-      muzzle: muzzleLocal,
+      _muzzleA: muzzleA,
+      _muzzleB: muzzleB,
+      _dir: dir,
     };
   }
 
@@ -3685,60 +4978,95 @@ export class Game {
       return;
     }
 
-    if (Math.abs(this.camera.fov - 64) > 0.1) {
-      this.camera.fov = 64;
+    if (Math.abs(this.camera.fov - 50) > 0.1) {
+      this.camera.fov = 50;
       this.camera.updateProjectionMatrix();
     }
 
-    const sway = Math.sin(t * 0.7) * 0.012;
-    const bob = Math.sin(t * 1.15) * 0.008;
-    this.camera.up.set(0, 1, 0);
-    this.camera.position.set(shot.cam.x, shot.cam.y + EYE + bob, shot.cam.z);
-    this.camera.rotation.set(0, 0, 0);
-    this.camera.rotateY(shot.yaw + sway * 0.35);
-    this.camera.rotateX(shot.pitch + sway * 0.15);
-    if (!this.camera.children.includes(this.marker)) this.camera.add(this.marker);
-    this.marker.visible = true;
-    const kick = 0.04 + Math.sin(t * 38) * 0.014;
-    this.marker.position.set(0.24, -0.22 - kick * 0.4, -0.46 + kick * 0.25);
-    this.marker.rotation.set(0.1 + kick * 1.6, 0.12, 0.03);
-
-    const pulse = 0.72 + Math.sin(t * 42) * 0.28;
-    if (shot.flash) {
-      shot.flash.visible = true;
-      shot.flash.scale.setScalar(0.9 + pulse * 0.5);
-      shot.flash.traverse((obj) => {
-        if (obj.material?.opacity != null) obj.material.opacity = 0.55 + pulse * 0.45;
-      });
+    if (this.marker) {
+      this.marker.visible = false;
+      this.camera.remove(this.marker);
     }
-    this.camera.updateMatrixWorld(true);
-    this.marker.updateMatrixWorld(true);
-    const muzzleWorld = (this.marker.userData.muzzle || shot.muzzle).clone();
-    this.marker.localToWorld(muzzleWorld);
-    this.muzzleLight.position.copy(muzzleWorld);
-    this.muzzleLight.intensity = 5.8 + pulse * 3.4;
-    this.muzzleLight.color.set(0xffe566);
 
-    const aim = shot.red.clone();
-    aim.y += 1.22 * BODY_K;
-    const dir = aim.clone().sub(muzzleWorld);
+    const orbit = Math.sin(t * 0.18) * 0.34;
+    const truck = Math.sin(t * 0.14) * 0.8;
+    const lift = Math.sin(t * 0.16) * 0.14;
+    const cam = this._menuPos;
+    cam.copy(shot.mid);
+    cam.addScaledVector(shot.perp, shot.camDist);
+    cam.addScaledVector(shot.axis, truck - 1.1);
+    cam.x += shot.perp.z * orbit * 1.7;
+    cam.z += -shot.perp.x * orbit * 1.7;
+    cam.y = shot.camY + lift;
+    const look = this._menuLook;
+    look.copy(shot.look);
+    look.y += Math.sin(t * 0.21) * 0.06;
+    this.camera.up.set(0, 1, 0);
+    this.camera.position.copy(cam);
+    this.camera.lookAt(look);
+
+    const blueBot = shot.blueBot;
+    const redBot = shot.redBot;
+    if (blueBot?.mesh) {
+      blueBot.walkPhase += dt * 1.55;
+      this.animateWalk(blueBot.mesh, 0.08, blueBot.walkPhase, 0.16, 0, 1, 0);
+      blueBot.mesh.rotation.y = blueBot.yaw;
+      if (blueBot.mesh.userData.gun) blueBot.mesh.userData.gun.visible = true;
+    }
+    if (redBot?.mesh) {
+      redBot.walkPhase += dt * 1.7;
+      this.animateWalk(redBot.mesh, 0.12, redBot.walkPhase, 0.04, 0, 1, 0);
+      redBot.mesh.rotation.y = redBot.yaw;
+      if (redBot.mesh.userData.gun) redBot.mesh.userData.gun.visible = true;
+    }
+
+    this.camera.updateMatrixWorld(true);
+    const muzzleA = shot._muzzleA;
+    const muzzleB = shot._muzzleB;
+    this.menuMuzzleWorld(blueBot, muzzleA);
+    this.menuMuzzleWorld(redBot, muzzleB);
+    const dir = shot._dir;
+    dir.copy(muzzleB).sub(muzzleA);
     if (dir.lengthSq() > 0.0001) dir.normalize();
     else dir.set(0, 0, -1);
-    for (const tr of shot.tracers) {
-      tr.u += dt * 0.18;
-      if (tr.u > 0.78) tr.u -= 0.54;
-      tr.mesh.position.lerpVectors(muzzleWorld, aim, tr.u);
-      tr.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+
+    const pulseA = 0.55 + Math.sin(t * 34) * 0.45;
+    const pulseB = 0.55 + Math.sin(t * 29 + 1.15) * 0.45;
+    const pulses = [pulseA, pulseB];
+    (shot.flashes || []).forEach((flash, i) => {
+      const pulse = pulses[i] ?? pulseA;
+      flash.visible = true;
+      flash.scale.setScalar(0.75 + pulse * 0.5);
+      flash.traverse((obj) => {
+        if (obj.material?.opacity != null) obj.material.opacity = 0.4 + pulse * 0.55;
+      });
+    });
+    this.muzzleLight.position.lerpVectors(muzzleA, muzzleB, 0.5);
+    this.muzzleLight.position.y += 0.15;
+    this.muzzleLight.intensity = 2.2 + pulseA * 1.6;
+    this.muzzleLight.color.set(0xffc48a);
+    if (shot.light) {
+      shot.light.position.copy(shot.mid);
+      shot.light.position.y += 2.2;
+      shot.light.intensity = 2.1 + pulseA * 0.35;
     }
 
-    if (shot.redBot?.alive) {
-      shot.redBot.walkPhase += dt * 4.8;
-      this.animateWalk(shot.redBot.mesh, 0.48, shot.redBot.walkPhase, 0, 0);
-      shot.redBot.mesh.rotation.y = shot.redBot.yaw;
+    for (const tr of shot.tracers || []) {
+      tr.u += dt * 0.22;
+      if (tr.u > 0.82) tr.u -= 0.6;
+      const a = tr.fromBlue ? muzzleA : muzzleB;
+      const b = tr.fromBlue ? muzzleB : muzzleA;
+      tr.mesh.position.lerpVectors(a, b, tr.u);
+      this._colDir.copy(dir).multiplyScalar(tr.fromBlue ? 1 : -1);
+      tr.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), this._colDir);
     }
   }
 
   tick() {
+    if (document.hidden) {
+      this.clock.getDelta();
+      return;
+    }
     if (!this.ready) {
       this.renderer.render(this.scene, this.camera);
       return;
@@ -3765,8 +5093,40 @@ export class Game {
       this.updateBalls(dt);
       this.updateGrenades(dt);
       this.updateFires(dt);
+      this.updateMatchTimer(dt);
       this.applyVisualCull();
-      this.drawRadar(dt);
+      this._radarTick = (this._radarTick || 0) + 1;
+      if (this._radarTick % 2 === 1) this.drawRadar(dt);
+      if (this.netOnline && this.net?.online && !this.out) {
+        const q = (n) => Math.round(n * 100) / 100;
+        this.net.sendPose({
+          x: q(this.pos.x),
+          y: q(this.pos.y),
+          z: q(this.pos.z),
+          yaw: q(this.yaw),
+          pitch: q(this.pitch),
+          crouch: q(this.crouch || 0),
+          walk: q(this.walkAmt || 0),
+          run: q(this.runAmt || 0),
+          alive: true,
+          plant: q(this.plantAmt || 0),
+          bots: this.net.isHost ? this.packNetBots() : undefined,
+        });
+      } else if (this.netOnline && this.net?.online) {
+        this.net.sendPose({
+          x: this.pos.x,
+          y: this.pos.y,
+          z: this.pos.z,
+          yaw: this.yaw,
+          pitch: this.pitch,
+          crouch: this.crouch || 0,
+          walk: 0,
+          run: 0,
+          alive: false,
+          plant: 0,
+          bots: this.net.isHost ? this.packNetBots() : undefined,
+        });
+      }
     } else if (this.state === "pause") {
       this.updateBalls(dt);
     }

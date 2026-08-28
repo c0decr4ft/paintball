@@ -22,8 +22,13 @@
           <button id="play" type="button">Play</button>
           <button id="event" type="button" class="alt">Endless</button>
           <button id="bomb" type="button" class="alt">Bomb</button>
+          <button id="online" type="button" class="alt">Online</button>
         </div>
       </div>
+    </div>
+
+    <div id="intro" hidden>
+      <p>one hit five lives...</p>
     </div>
 
     <div id="hud" hidden>
@@ -42,9 +47,13 @@
         <b id="swarm-size">4</b>
       </div>
       <div class="ammo-quiet">
-        <span id="ammo">200</span>
+        <em id="gun-name">Glock</em>
+        <span id="ammo">17</span>
         <b id="nades">1</b>
       </div>
+      <div id="hp-bar"><i id="hp-fill"></i></div>
+      <div id="use-prompt"></div>
+      <div id="match-clock">3:00</div>
       <div id="bomb-hud" hidden>
         <div id="bomb-carry" hidden>C4</div>
         <div id="bomb-clock" hidden>0:40</div>

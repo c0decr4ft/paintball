@@ -53,9 +53,11 @@ export class AudioEngine {
   }
 
   shoot() {
-    this.noise(0.07, 0.16, 400);
-    this.tone(90, 0.09, "sawtooth", 0.08, -50);
-    this.tone(220, 0.04, "square", 0.05, -120);
+    this.noise(0.12, 0.34, 220);
+    this.noise(0.07, 0.18, 1100);
+    this.tone(62, 0.16, "sine", 0.16, -22);
+    this.tone(105, 0.12, "sawtooth", 0.18, -60);
+    this.tone(250, 0.06, "square", 0.11, -150);
   }
 
   impact() {
