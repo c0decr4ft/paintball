@@ -1,22 +1,30 @@
-# Host Paintfield on Render
+# Host PAIN - FIELD on Render
 
-Render runs the game **and** the multiplayer WebSocket on one URL. GitHub Pages cannot do rooms.
+Render must serve **PAIN - FIELD** with the two playable maps (`pvp_map.glb` and
+`castle_wars_pavlov_vr.glb`), not `cs_office` / `de_dust2`.
 
-Your repo already has `render.yaml`. Play URL after deploy: `https://paintfield.onrender.com`
+The only gun is the original blaster (`public/models/blaster.glb`).
+
+Render runs the Vite client **and** the multiplayer WebSocket on one URL. GitHub Pages cannot host rooms.
+
+Play URL after a blueprint deploy named `paintfield`: **https://paintfield.onrender.com**
+
+If you rename the service, the URL is `https://<service-name>.onrender.com`. Same-origin WebSockets still work; only `public/online.json` and the keep-alive ping need the new host.
 
 ---
 
 ## 1. Push the game to GitHub
 
-If this machine is already `c0decr4ft/paintball`, skip to step 2.
+The deploy clone must include the runtime GLBs. They are no longer gitignored:
 
-```bash
-git add -A
-git commit -m "Ready for Render"
-git push -u origin HEAD
-```
+- `public/models/pvp_map.glb` (abandoned village — required)
+- `public/models/castle_wars_pavlov_vr.glb`
+- `public/models/clone_commando.glb`
+- `public/models/phoenix.glb`
+- `public/models/blaster.glb`
+- `public/models/cs_go_bomb.glb`
 
-The branch you deploy should include `render.yaml`, `server/index.mjs`, `public/online.json`, and `package.json` scripts `build` / `start`.
+Commit those files on the branch you deploy (often `cursor/village-pvp-bomb-gameplay` or `main`), plus `render.yaml`, `server/index.mjs`, `public/online.json`, and `package.json` scripts `build` / `start`.
 
 ---
 
@@ -36,16 +44,14 @@ The branch you deploy should include `render.yaml`, `server/index.mjs`, `public/
 4. Confirm:
    - **Region:** Frankfurt
    - **Plan:** Free
-   - **Branch:** the branch you pushed (often `main`, or `cursor/village-pvp-bomb-gameplay`)
+   - **Branch:** the branch you pushed
 5. Click **Apply** / **Create**
 
-Wait until the service is **Live** (first build is 3–8 minutes).
+Wait until the service is **Live** (first build is 3–8 minutes). Do **not** set `PORT` yourself — Render injects it. The process binds `0.0.0.0` and `process.env.PORT`.
 
 ---
 
 ## 4. Or create the Web Service by hand
-
-If the blueprint is not used:
 
 1. Dashboard → **New** → **Web Service**
 2. Connect `c0decr4ft/paintball`
@@ -59,7 +65,7 @@ If the blueprint is not used:
 | Runtime | Node |
 | Build command | `npm ci --include=dev && npm run build` |
 | Start command | `npm start` |
-| Health check path | `/healthz` |
+| Health check path | `/health` |
 | Plan | Free |
 
 4. Environment:
@@ -67,50 +73,51 @@ If the blueprint is not used:
 | Key | Value |
 | --- | --- |
 | `NODE_ENV` | `production` |
+| `NODE_VERSION` | `22` |
 | `HOST` | `0.0.0.0` |
-| `PORT` | `10000` |
 
-`--include=dev` is required. With `NODE_ENV=production`, plain `npm ci` skips Vite and the build fails.
+Leave `PORT` unset. `--include=dev` is required so Vite is installed when `NODE_ENV=production`.
 
 5. **Create Web Service** → wait until Live.
+
+Optional: `VITE_WS_URL` (baked in at **build** time) if you must pin a socket host. Same-origin play on Render does not need it.
 
 ---
 
 ## 5. Check it is up
 
-In a browser:
-
 - Game: [https://paintfield.onrender.com](https://paintfield.onrender.com)
-- Health: [https://paintfield.onrender.com/healthz](https://paintfield.onrender.com/healthz) should return `{"ok":true,...}`
+- Health: [https://paintfield.onrender.com/health](https://paintfield.onrender.com/health) → `{"ok":true,...}`
+- A model: [https://paintfield.onrender.com/models/pvp_map.glb](https://paintfield.onrender.com/models/pvp_map.glb) should download, not 404
 
 In the game: **Online** → create or join a room. Two browsers on that URL should see each other.
 
-If the page 404s or is an old build, open the service → **Manual Deploy** → **Deploy latest commit**.
+Free instances sleep after ~15 minutes idle. The first request can take ~30s to wake.
+
+If the page 404s or is an old build: service → **Manual Deploy** → **Deploy latest commit**.
 
 ---
 
-## 6. Point the client at Render (already done for this repo)
+## 6. Client WebSocket URL
 
-`public/online.json` is:
+On Render (or any `npm start` production build), the page uses **same-origin** `wss://` / `ws://` on `https` / `http`. You do not need `online.json` for that.
+
+`public/online.json` is a fallback for GitHub Pages:
 
 ```json
 { "wsUrl": "wss://paintfield.onrender.com" }
 ```
 
-Same-origin play on Render does not need this file (the page talks to its own host). Keep it so GitHub Pages can still reach the cloud socket.
-
-If your Render URL is different, change `wsUrl` to `wss://YOUR-SERVICE.onrender.com` and redeploy.
+If your Render URL is different and you still use GitHub Pages, change `wsUrl` and redeploy Pages.
 
 ---
 
 ## 7. Keep the free instance awake (optional)
 
-Free Render **sleeps after ~15 minutes idle**. The next join can take ~30s to wake.
+`.github/workflows/keep-alive.yml` pings `/health` every 10 minutes. Scheduled workflows only run on the **default** branch.
 
-This repo has `.github/workflows/keep-alive.yml`. It pings `/healthz` on a schedule.
-
-1. GitHub repo → **Actions** → enable workflows if asked
-2. Push the workflow file to the default branch
+1. GitHub repo → **Actions** → enable workflows
+2. If the live URL is not `https://paintfield.onrender.com`, add Actions variable `RENDER_HEALTH_URL` = `https://YOUR-SERVICE.onrender.com/health`
 3. **Actions** → **Keep Render awake** → **Run workflow** once to test
 
 For no sleep, upgrade the Render plan.
@@ -125,19 +132,26 @@ git commit -m "Describe the change"
 git push
 ```
 
-Render rebuilds on push if auto-deploy is on (default). Otherwise: service → **Manual Deploy** → **Deploy latest commit**.
-
-Hard-refresh the game (`Cmd+Shift+R`) so the new JS/textures load.
+Render rebuilds on push if auto-deploy is on. Hard-refresh the game (`Cmd+Shift+R`) so hashed JS and GLBs reload.
 
 ---
 
-## Local multiplayer (your PC stays on)
+## Local production (same path as Render)
+
+```bash
+RENDER=true npm run build
+HOST=127.0.0.1 PORT=4174 npm start
+```
+
+Open `http://127.0.0.1:4174`. This is the Render path (Node serves `dist/` + WebSocket). Vite on port 5173 is **dev only**.
+
+Local multiplayer with HMR:
 
 ```bash
 npm run start:local
 ```
 
-Open `http://127.0.0.1:5173` (or the port Vite prints). Do **not** use `online.json` against Render while testing on localhost — the client already prefers `ws://127.0.0.1:8787`.
+Open the Vite URL (usually `http://127.0.0.1:5173`). The client talks to `ws://127.0.0.1:8787`.
 
 ---
 
@@ -146,7 +160,8 @@ Open `http://127.0.0.1:5173` (or the port Vite prints). Do **not** use `online.j
 | Symptom | Fix |
 | --- | --- |
 | Build: `vite: not found` | Build command must be `npm ci --include=dev && npm run build` |
-| Service starts then dies | Start command must be `npm start` (`node server/index.mjs`), not `vite` |
-| Game loads, Online never connects | Confirm `/healthz` on the same host; wait for a cold start; check browser console for `wss://` errors |
-| Blank page | Open the service logs; a failed `npm run build` still “deploys” an empty `dist/` |
-| Old map/textures | Hard-refresh; `loadGameAssets` caches the GLB in the tab |
+| Service starts then dies | Start command must be `npm start` (`node server/index.mjs`), not `vite`. Do not override `PORT`. |
+| Game loads, Online never connects | Confirm `/health` on the same host; wait for a cold start; console should show `wss://` to **this** origin |
+| Blank page / missing guns | Logs: `missing models in dist/`. Commit the GLBs listed above. |
+| `/health` 404 | Health path must be `/health` (older docs used `/healthz`, still aliased) |
+| Keep-alive hits a dead host | Set `RENDER_HEALTH_URL` or rename the service back to `paintfield` |

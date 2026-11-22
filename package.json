@@ -1,8 +1,11 @@
 {
-  "name": "paintfield",
+  "name": "pain-field",
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "vite",
     "server": "node server/index.mjs",

@@ -1,5 +1,6 @@
 # One-click always-on host: https://dashboard.render.com/select-repo?type=blueprint
 # Free web service sleeps after ~15m idle — first multiplayer join may take ~30s to wake.
+# Public URL is https://<name>.onrender.com (this service: https://paintfield.onrender.com).
 services:
   - type: web
     name: paintfield
@@ -9,11 +10,12 @@ services:
     # --include=dev: NODE_ENV=production would skip vite otherwise.
     buildCommand: npm ci --include=dev && npm run build
     startCommand: npm start
-    healthCheckPath: /healthz
+    healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: "22"
       - key: HOST
         value: 0.0.0.0
-      - key: PORT
-        value: 10000
+      # Do not set PORT — Render injects it. Binding uses process.env.PORT.

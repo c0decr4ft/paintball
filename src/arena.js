@@ -1,15 +1,27 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 import { clone as cloneSkinned } from "three/addons/utils/SkeletonUtils.js";
-import { cautionTexture, crateTexture, gymCourtFloorTexture, gymCourtWallTexture } from "./textures.js";
+import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
+import { cautionTexture, crateTexture, villageFloorTexture, villageWallTexture } from "./textures.js";
 
 export const TEAM = {
   blue: 0x008cff,
   red: 0xff1a12,
 };
 
-const MAP_URL = `${import.meta.env.BASE_URL}models/pvp_map.glb`;
+export const PLAYABLE_MAPS = [
+  { id: "pvp_map", file: "pvp_map.glb" },
+  { id: "castle_wars", file: "castle_wars_pavlov_vr.glb" },
+];
+
+function mapUrl(file) {
+  return `${import.meta.env.BASE_URL}models/${file}`;
+}
+
+export function pickPlayableMapId() {
+  return Math.random() < 0.5 ? PLAYABLE_MAPS[0].id : PLAYABLE_MAPS[1].id;
+}
+
 const COMMANDO_URL = `${import.meta.env.BASE_URL}models/clone_commando.glb`;
 const PHOENIX_URL = `${import.meta.env.BASE_URL}models/phoenix.glb`;
 const BLASTER_URL = `${import.meta.env.BASE_URL}models/blaster.glb`;
@@ -20,7 +32,7 @@ const MP5_URL = `${import.meta.env.BASE_URL}models/mp5_submachine_gun.glb`;
 
 export const MAX_HP = 100;
 
-/** Glock hits hard and slow. Roach sprays fast for chip damage. MP5 sits in between. */
+/** Glock hits hard and slow. Roach sprays fast. MP5 sits in between. */
 export const WEAPONS = {
   glock: {
     id: "glock",
@@ -31,9 +43,9 @@ export const WEAPONS = {
     reload: 1.5,
     weight: 52,
     recoil: 0.07,
-    fpsLen: 0.34,
+    fpsLen: 0.4,
     worldLen: 0.2,
-    adsFov: 50,
+    adsFov: 52,
   },
   roach: {
     id: "roach",
@@ -44,7 +56,7 @@ export const WEAPONS = {
     reload: 1.35,
     weight: 34,
     recoil: 0.022,
-    fpsLen: 0.38,
+    fpsLen: 0.46,
     worldLen: 0.24,
     adsFov: 50,
   },
@@ -57,16 +69,18 @@ export const WEAPONS = {
     reload: 1.8,
     weight: 14,
     recoil: 0.03,
-    fpsLen: 0.7,
-    worldLen: 0.66,
-    adsFov: 42,
+    fpsLen: 0.9,
+    worldLen: 0.72,
+    adsFov: 38,
   },
 };
 
 export const DEFAULT_WEAPON = "glock";
 
-/** @type {THREE.Object3D | null} */
-let mapTemplate = null;
+/** @type {Record<string, THREE.Object3D>} */
+const mapTemplates = {};
+/** @type {string | null} */
+let activeMapId = null;
 /** @type {THREE.Object3D | null} */
 let commandoTemplate = null;
 /** @type {THREE.Object3D | null} */
@@ -96,6 +110,14 @@ function loadGltf(url) {
   });
 }
 
+async function loadRequiredGltf(url, label) {
+  try {
+    return await loadGltf(url);
+  } catch {
+    throw new Error(`Missing ${label} (${url}).`);
+  }
+}
+
 let _wallDraw = null;
 let _floorDraw = null;
 let _crateDraw = null;
@@ -105,15 +127,15 @@ function styleVillageMap(root) {
   if (!root) return;
   if (!_wallDraw) {
     _wallDraw = new THREE.MeshLambertMaterial({
-      map: gymCourtWallTexture(),
-      color: 0xf6ead8,
+      map: villageWallTexture(),
+      color: 0xffffff,
       fog: true,
     });
   }
   if (!_floorDraw) {
     _floorDraw = new THREE.MeshLambertMaterial({
-      map: gymCourtFloorTexture(),
-      color: 0xeee4d4,
+      map: villageFloorTexture(),
+      color: 0xffffff,
       fog: true,
       side: THREE.DoubleSide,
     });
@@ -151,26 +173,83 @@ function styleVillageMap(root) {
   });
 }
 
-export async function loadGameAssets(onProgress) {
-  if (mapTemplate && commandoTemplate && blasterTemplate && weaponTemplates.glock) {
-    styleVillageMap(mapTemplate);
-    return mapTemplate;
+function isGlassMesh(mesh) {
+  if (!mesh?.isMesh) return false;
+  const n = `${mesh.name || ""} ${meshMatName(mesh)}`.toLowerCase();
+  return n.includes("glass");
+}
+
+function toBakedBasic(src) {
+  if (!src) return src;
+  if (src.isMeshBasicMaterial) {
+    fixTextureColorSpace(src);
+    src.toneMapped = false;
+    return src;
   }
-  const [mapGltf, commandoGltf, phoenixGltf, blasterGltf, bombGltf, glockGltf, pistolGltf, mp5Gltf] = await Promise.all([
-    mapTemplate ? Promise.resolve(null) : loadGltf(MAP_URL),
-    commandoTemplate ? Promise.resolve(null) : loadGltf(COMMANDO_URL),
-    phoenixTemplate ? Promise.resolve(null) : loadGltf(PHOENIX_URL).catch(() => null),
-    blasterTemplate ? Promise.resolve(null) : loadGltf(BLASTER_URL),
-    bombTemplate ? Promise.resolve(null) : loadGltf(BOMB_URL),
-    weaponTemplates.glock ? Promise.resolve(null) : loadGltf(GLOCK_URL).catch(() => null),
-    weaponTemplates.roach ? Promise.resolve(null) : loadGltf(PISTOL_URL).catch(() => null),
-    weaponTemplates.mp5 ? Promise.resolve(null) : loadGltf(MP5_URL).catch(() => null),
+  const m = new THREE.MeshBasicMaterial();
+  if (src.color) m.color.copy(src.color);
+  m.map = src.map || src.emissiveMap || null;
+  m.lightMap = src.lightMap || null;
+  m.lightMapIntensity = src.lightMapIntensity ?? 1;
+  m.vertexColors = Boolean(src.vertexColors);
+  m.side = src.side;
+  m.transparent = src.transparent;
+  m.opacity = src.opacity;
+  m.alphaTest = src.alphaTest || 0;
+  m.depthWrite = src.depthWrite !== false;
+  m.fog = src.fog !== false;
+  m.toneMapped = false;
+  m.name = src.name;
+  fixTextureColorSpace(m);
+  return m;
+}
+
+/** Keep MeshBasic baked lighting; convert lit mats to basic. Never village plaster. */
+function stylePlayableMap(root) {
+  if (!root) return;
+  root.traverse((obj) => {
+    if (!obj.isMesh) return;
+    obj.castShadow = false;
+    obj.receiveShadow = false;
+    obj.frustumCulled = true;
+    const list = Array.isArray(obj.material) ? obj.material : [obj.material];
+    const next = list.map((m) => {
+      if (!m) return m;
+      const baked = toBakedBasic(m);
+      if (isGlassMesh(obj) || m.transparent || baked.transparent) {
+        baked.transparent = true;
+        baked.opacity = Math.min(baked.opacity ?? 1, 0.28);
+        baked.depthWrite = false;
+        obj.userData.noCollide = true;
+      }
+      return baked;
+    });
+    obj.material = Array.isArray(obj.material) ? next : next[0];
+  });
+}
+
+export async function loadGameAssets(onProgress) {
+  const mapsReady = PLAYABLE_MAPS.every((m) => mapTemplates[m.id]);
+  if (mapsReady && commandoTemplate && phoenixTemplate && blasterTemplate && bombTemplate) {
+    for (const m of PLAYABLE_MAPS) stylePlayableMap(mapTemplates[m.id]);
+    return mapTemplates[activeMapId] || mapTemplates[PLAYABLE_MAPS[0].id];
+  }
+  const mapLoads = PLAYABLE_MAPS.map((m) =>
+    mapTemplates[m.id] ? Promise.resolve(null) : loadRequiredGltf(mapUrl(m.file), m.file).then((gltf) => ({ id: m.id, gltf }))
+  );
+  const [mapHits, commandoGltf, phoenixGltf, blasterGltf, bombGltf] = await Promise.all([
+    Promise.all(mapLoads),
+    commandoTemplate ? Promise.resolve(null) : loadRequiredGltf(COMMANDO_URL, "clone_commando.glb"),
+    phoenixTemplate ? Promise.resolve(null) : loadRequiredGltf(PHOENIX_URL, "phoenix.glb"),
+    blasterTemplate ? Promise.resolve(null) : loadRequiredGltf(BLASTER_URL, "blaster.glb"),
+    bombTemplate ? Promise.resolve(null) : loadRequiredGltf(BOMB_URL, "cs_go_bomb.glb"),
   ]);
   onProgress?.(1, "assets");
 
-  if (mapGltf) {
-    mapTemplate = mapGltf.scene;
-    styleVillageMap(mapTemplate);
+  for (const hit of mapHits) {
+    if (!hit?.gltf) continue;
+    mapTemplates[hit.id] = hit.gltf.scene;
+    stylePlayableMap(mapTemplates[hit.id]);
   }
 
   if (commandoGltf) {
@@ -179,10 +258,13 @@ export async function loadGameAssets(onProgress) {
       obj.castShadow = false;
       obj.receiveShadow = false;
       const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-      for (const m of mats) {
+      const next = mats.map((m) => {
+        if (!m) return m;
         fixTextureColorSpace(m);
-        if (m) m.envMapIntensity = 0;
-      }
+        if (m.envMapIntensity != null) m.envMapIntensity = 0;
+        return cheapMat(m);
+      });
+      obj.material = Array.isArray(obj.material) ? next : next[0];
     });
     commandoTemplate = commandoGltf.scene;
   }
@@ -193,10 +275,13 @@ export async function loadGameAssets(onProgress) {
       obj.castShadow = false;
       obj.receiveShadow = false;
       const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-      for (const m of mats) {
+      const next = mats.map((m) => {
+        if (!m) return m;
         fixTextureColorSpace(m);
-        if (m) m.envMapIntensity = 0;
-      }
+        if (m.envMapIntensity != null) m.envMapIntensity = 0;
+        return cheapMat(m);
+      });
+      obj.material = Array.isArray(obj.material) ? next : next[0];
     });
     phoenixTemplate = phoenixGltf.scene;
   }
@@ -207,10 +292,13 @@ export async function loadGameAssets(onProgress) {
       obj.castShadow = false;
       obj.receiveShadow = false;
       const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-      for (const m of mats) {
+      const next = mats.map((m) => {
+        if (!m) return m;
         fixTextureColorSpace(m);
-        if (m) m.envMapIntensity = 0;
-      }
+        if (m.envMapIntensity != null) m.envMapIntensity = 0;
+        return cheapMat(m);
+      });
+      obj.material = Array.isArray(obj.material) ? next : next[0];
     });
     blasterTemplate = blasterGltf.scene;
   }
@@ -221,19 +309,18 @@ export async function loadGameAssets(onProgress) {
       obj.castShadow = false;
       obj.receiveShadow = false;
       const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-      for (const m of mats) {
+      const next = mats.map((m) => {
+        if (!m) return m;
         fixTextureColorSpace(m);
-        if (m) m.envMapIntensity = 0;
-      }
+        if (m.envMapIntensity != null) m.envMapIntensity = 0;
+        return cheapMat(m);
+      });
+      obj.material = Array.isArray(obj.material) ? next : next[0];
     });
     bombTemplate = bombGltf.scene;
   }
 
-  if (glockGltf) weaponTemplates.glock = prepareGunTemplate(glockGltf.scene);
-  if (pistolGltf) weaponTemplates.roach = prepareGunTemplate(pistolGltf.scene);
-  if (mp5Gltf) weaponTemplates.mp5 = prepareGunTemplate(mp5Gltf.scene);
-
-  return mapTemplate;
+  return mapTemplates[activeMapId] || mapTemplates[PLAYABLE_MAPS[0].id];
 }
 
 function prepareGunTemplate(root) {
@@ -358,7 +445,7 @@ function batchMapMeshes(map) {
     mesh.matrixAutoUpdate = false;
   });
   for (const mesh of originals) {
-    if (isExplosiveMesh(mesh) || isCrateMesh(mesh)) continue;
+    if (isExplosiveMesh(mesh) || isCrateMesh(mesh) || mesh.userData?.noCollide) continue;
     const mat = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
     if (!mat) continue;
     const box = mesh.userData.worldBox || new THREE.Box3().setFromObject(mesh);
@@ -387,7 +474,7 @@ function batchMapMeshes(map) {
       if (merged) {
         merged.computeBoundingSphere();
         merged.computeBoundingBox();
-        const draw = new THREE.Mesh(merged, litFast(mat));
+        const draw = new THREE.Mesh(merged, toBakedBasic(mat));
         draw.castShadow = false;
         draw.receiveShadow = false;
         draw.matrixAutoUpdate = false;
@@ -459,49 +546,85 @@ function makeSky() {
   return sky;
 }
 
-/** Fit the village to a 1.82 m human (doors/ceilings feel walkable, not stadium-sized). */
-const MAP_SCALE = 0.62;
+function computeMapScale(rawBox) {
+  const h = rawBox.max.y - rawBox.min.y;
+  const span = Math.max(rawBox.max.x - rawBox.min.x, rawBox.max.z - rawBox.min.z);
+  if (h < 1.6 && span < 12) return THREE.MathUtils.clamp(3.2 / Math.max(h, 0.4), 1, 2.4);
+  if (h > 48 || span > 280) return THREE.MathUtils.clamp(22 / Math.max(h, span * 0.12), 0.35, 1);
+  return 1;
+}
 
-export function buildArena(scene) {
+export function disposeArena(scene, arena) {
+  if (!arena?.world) return;
+  if (arena.world.parent) arena.world.parent.remove(arena.world);
+  arena.batched?.traverse((obj) => {
+    obj.geometry?.dispose?.();
+  });
+}
+
+export function buildArena(scene, mapId) {
+  const id = PLAYABLE_MAPS.some((m) => m.id === mapId) ? mapId : pickPlayableMapId();
+  const mapTemplate = mapTemplates[id];
   if (!mapTemplate) throw new Error("Call loadGameAssets() before buildArena()");
+  activeMapId = id;
 
-  scene.background = new THREE.Color(0xb8c4a0);
-  scene.fog = new THREE.Fog(0xc5b898, 38, 96);
+  mapTemplate.updateMatrixWorld(true);
+  const rawBox = new THREE.Box3().setFromObject(mapTemplate);
+  const MAP_SCALE = computeMapScale(rawBox);
+
+  scene.background = new THREE.Color(0x10100e);
 
   const world = new THREE.Group();
   world.name = "world";
   scene.add(world);
-  world.add(makeSky());
 
-  scene.add(new THREE.HemisphereLight(0xe8dcc0, 0x8a7a58, 1.22));
-  const sun = new THREE.DirectionalLight(0xffe6c4, 1.55);
-  sun.position.set(14, 32, 12);
-  sun.castShadow = false;
-  scene.add(sun);
+  if (!scene.children.some((c) => c.isHemisphereLight)) {
+    scene.add(new THREE.HemisphereLight(0xe8e2d6, 0x3a3228, 1.22));
+  }
+  if (!scene.children.some((c) => c.isDirectionalLight)) {
+    const sun = new THREE.DirectionalLight(0xffead4, 0.92);
+    sun.position.set(18, 28, 10);
+    sun.castShadow = false;
+    scene.add(sun);
+  }
 
   const map = mapTemplate.clone(true);
-  styleVillageMap(map);
+  stylePlayableMap(map);
   map.scale.setScalar(MAP_SCALE);
   map.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(map);
-  const center = box.getCenter(new THREE.Vector3());
-  map.position.x -= center.x;
-  map.position.z -= center.z;
+  const fitBox = new THREE.Box3().setFromObject(map);
+  map.position.x -= (fitBox.min.x + fitBox.max.x) * 0.5;
+  map.position.y -= fitBox.min.y;
+  map.position.z -= (fitBox.min.z + fitBox.max.z) * 0.5;
   map.updateMatrixWorld(true);
   world.add(map);
 
   const walkMeshes = [];
   const wallMeshes = [];
   const floorMeshes = [];
+  const mapFoot = new THREE.Box3().setFromObject(map);
+  const mapW = mapFoot.max.x - mapFoot.min.x;
+  const mapD = mapFoot.max.z - mapFoot.min.z;
   map.traverse((obj) => {
     if (!obj.isMesh) return;
     obj.updateWorldMatrix(true, false);
     obj.userData.worldBox = new THREE.Box3().setFromObject(obj);
+    if (obj.userData.noCollide || isGlassMesh(obj)) {
+      obj.userData.noCollide = true;
+      return;
+    }
     if (isPropSolid(obj)) obj.userData.propSolid = true;
     walkMeshes.push(obj);
-    const name = (obj.name || "").toLowerCase();
-    if (/floor/.test(name)) floorMeshes.push(obj);
-    else wallMeshes.push(obj);
+    const box = obj.userData.worldBox;
+    const hy = box ? box.max.y - box.min.y : 1;
+    const hx = box ? box.max.x - box.min.x : 0;
+    const hz = box ? box.max.z - box.min.z : 0;
+    const mapShell = hx > mapW * 0.82 && hz > mapD * 0.82 && hy > 3.2;
+    // pvp_map stores much of its architecture in one large mesh. Excluding that
+    // shell made its internal walls entirely pass-through. Castle has separate
+    // wall meshes, so retaining its huge shell would only inflate raycast cost.
+    if (hy >= 0.62 && (!mapShell || id === "pvp_map")) wallMeshes.push(obj);
+    floorMeshes.push(obj);
   });
 
   const batched = batchMapMeshes(map);
@@ -543,7 +666,7 @@ export function buildArena(scene) {
     const hits = ray.intersectObjects(objs, false);
     let best = null;
     for (const h of hits) {
-      if (h.object.userData.exploded || h.object.userData.propSolid) continue;
+      if (h.object.userData.exploded || h.object.userData.propSolid || h.object.userData.noCollide) continue;
       if (h.face) {
         _n.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
       } else {
@@ -565,7 +688,7 @@ export function buildArena(scene) {
     ray.far = Math.max(0.2, maxDist);
     const hits = ray.intersectObjects(objs, false);
     for (const h of hits) {
-      if (h.object.userData.exploded) continue;
+      if (h.object.userData.exploded || h.object.userData.noCollide) continue;
       if (skipProp && h.object.userData.propSolid) continue;
       return h;
     }
@@ -612,37 +735,8 @@ export function buildArena(scene) {
    */
   const roofCache = new Map();
   let roofDeckY = 3.5;
-  function isRooftop(x, z, feetY) {
-    const y = Number.isFinite(feetY) ? feetY : 0;
-    const k = `${(x * 4) | 0}:${(z * 4) | 0}:${(y * 4) | 0}`;
-    if (roofCache.has(k)) return roofCache.get(k);
-    if (y < roofDeckY - 0.55) {
-      roofCache.set(k, false);
-      return false;
-    }
-    const hit = groundHit(x, z, y + STEP, y + STEP);
-    if (!hit || Math.abs(hit.point.y - y) > 0.16) {
-      roofCache.set(k, false);
-      return false;
-    }
-    const gy = hit.point.y;
-    if (gy < roofDeckY - 0.32) {
-      roofCache.set(k, false);
-      return false;
-    }
-    const mesh = hit.object;
-    const name = (mesh.name || "").toLowerCase();
-    if (isExplosiveMesh(mesh) || isCrateMesh(mesh) || /floor|pallet/.test(name)) {
-      roofCache.set(k, false);
-      return false;
-    }
-    const ceil = ceilingAt(x, z, gy + 0.22, 2.4);
-    if (ceil != null && ceil - gy < 2.35) {
-      roofCache.set(k, false);
-      return false;
-    }
-    roofCache.set(k, true);
-    return true;
+  function isRooftop() {
+    return false;
   }
   const isRoofAt = isRooftop;
 
@@ -663,34 +757,29 @@ export function buildArena(scene) {
   function blockedXZ(x, z, radius = 0.55, yHint = 0) {
     const gy = groundAt(x, z, yHint);
     if (gy == null) return true;
-    const walls = nearbyWalls(x, z, radius + 1.2);
-    if (!walls.length) return false;
     const ceil = ceilingAt(x, z, gy + 0.18, 1.9 * BODY_K);
     if (ceil != null && ceil - gy < 0.86) return true;
-    const dirs = [
-      [1, 0],
-      [-1, 0],
-      [0, 1],
-      [0, -1],
-      [0.71, 0.71],
-      [-0.71, 0.71],
-      [0.71, -0.71],
-      [-0.71, -0.71],
-    ];
-    const probes = [gy + 0.42 * BODY_K, gy + 1.12 * BODY_K];
-    for (const py of probes) {
-      for (const [dx, dz] of dirs) {
-        _dir.set(dx, 0, dz);
-        _from.set(x, py, z);
-        ray.set(_from, _dir);
-        ray.near = 0;
-        ray.far = radius + 0.08;
-        const hit = ray.intersectObjects(walls, false)[0];
-        if (!hit || hit.object.userData.exploded) continue;
-        const wb = hit.object.userData.worldBox;
-        if (wb && wb.min.y > py + 0.14) continue;
-        return true;
+    const yLo = gy + 0.38 * BODY_K;
+    const yHi = gy + 1.08 * BODY_K;
+    const r2 = radius * radius;
+    for (const mesh of nearbyWalls(x, z, radius + 0.85)) {
+      if (mesh.userData.exploded || mesh.userData.noCollide) continue;
+      const box = mesh.userData.worldBox;
+      if (!box) continue;
+      const hy = box.max.y - box.min.y;
+      const hx = box.max.x - box.min.x;
+      const hz = box.max.z - box.min.z;
+      if (hy < 0.55) continue;
+      if (box.max.y < yLo || box.min.y > yHi) continue;
+      if (hx > 10 && hz > 10) {
+        const edge = Math.min(x - box.min.x, box.max.x - x, z - box.min.z, box.max.z - z);
+        if (edge > radius + 0.16) continue;
       }
+      const cx = Math.max(box.min.x, Math.min(x, box.max.x));
+      const cz = Math.max(box.min.z, Math.min(z, box.max.z));
+      const dx = x - cx;
+      const dz = z - cz;
+      if (dx * dx + dz * dz < r2) return true;
     }
     return false;
   }
@@ -699,6 +788,9 @@ export function buildArena(scene) {
   const halfX = (worldBox.max.x - worldBox.min.x) / 2;
   const halfZ = (worldBox.max.z - worldBox.min.z) / 2;
   const roof = worldBox.max.y;
+  const spanXZ = Math.hypot(worldBox.max.x - worldBox.min.x, worldBox.max.z - worldBox.min.z);
+  scene.fog = new THREE.Fog(0x1a1814, Math.max(36, spanXZ * 0.4), Math.max(120, spanXZ * 1.25));
+  const camFar = Math.max(160, Math.min(420, spanXZ * 1.85 + roof * 3));
   {
     const bins = new Map();
     for (const mesh of wallMeshes) {
@@ -723,51 +815,162 @@ export function buildArena(scene) {
     if (best > 1.5) roofDeckY = best;
   }
 
+  function floorsAt(x, z) {
+    const objs = walkObjs(x, z);
+    if (!objs.length) return [];
+    _from.set(x, worldBox.max.y + 2.4, z);
+    ray.set(_from, down);
+    ray.near = 0.02;
+    ray.far = Math.max(4, worldBox.max.y + 6);
+    const hits = ray.intersectObjects(objs, false);
+    const ys = [];
+    for (const h of hits) {
+      if (h.object.userData.exploded || h.object.userData.noCollide || h.object.userData.propSolid) continue;
+      if (h.face) _n.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
+      else _n.set(0, 1, 0);
+      if (_n.y < 0.42) continue;
+      const y = h.point.y;
+      if (ys.some((v) => Math.abs(v - y) < 0.4)) continue;
+      const overhead = ceilingHit(x, z, y + 0.18, 5.2, true);
+      const room = overhead ? overhead.point.y - y : 8;
+      if (room < 2.05) continue;
+      ys.push(y);
+    }
+    return ys;
+  }
+
   const rawWaypoints = [];
-  for (let x = worldBox.min.x + 1.4; x <= worldBox.max.x - 1.4; x += 1.7) {
-    for (let z = worldBox.min.z + 1.4; z <= worldBox.max.z - 1.4; z += 1.7) {
-      if (blockedXZ(x, z, 0.7, 0.12)) continue;
-      const y = groundAt(x, z, 0.12);
-      if (y == null) continue;
-      rawWaypoints.push(new THREE.Vector3(x, y, z));
-    }
+  const spanX = worldBox.max.x - worldBox.min.x;
+  const spanZ = worldBox.max.z - worldBox.min.z;
+  // Castle is long and visually detailed. A coarser one-time nav sample keeps
+  // loading and path setup bounded without touching render detail.
+  const TARGET_CELLS = id === "castle_wars" ? 240 : 380;
+  let stepX = 2.5;
+  let stepZ = 2.5;
+  const guess = (spanX / stepX) * (spanZ / stepZ);
+  if (guess > TARGET_CELLS) {
+    const grow = Math.sqrt(guess / TARGET_CELLS);
+    stepX *= grow;
+    stepZ *= grow;
   }
-  const groundWaypoints = rawWaypoints.filter((w) => !isRoofAt(w.x, w.z, w.y));
-  const waypoints = groundWaypoints.length ? groundWaypoints : rawWaypoints;
-
-  function spawnOpenness(w) {
-    if (blockedXZ(w.x, w.z, 1.05, w.y)) return -1e6;
-    let open = 0;
-    const ring = [
-      [1, 0],
-      [-1, 0],
-      [0, 1],
-      [0, -1],
-      [0.71, 0.71],
-      [-0.71, 0.71],
-      [0.71, -0.71],
-      [-0.71, -0.71],
-    ];
-    for (const [dx, dz] of ring) {
-      if (!blockedXZ(w.x + dx * 1.15, w.z + dz * 1.15, 0.55, w.y)) open += 1;
-    }
-    return open;
-  }
-
-  function pickSpawn(scoreFn) {
-    let best = waypoints[0] || new THREE.Vector3(0, 0, 0);
-    let bestS = -Infinity;
-    for (const w of waypoints) {
-      if (isRoofAt(w.x, w.z, w.y)) continue;
-      const open = spawnOpenness(w);
-      if (open < -1e5) continue;
-      const s = scoreFn(w) + open * 3.2;
-      if (s > bestS) {
-        bestS = s;
-        best = w;
+  stepX = Math.max(2.2, Math.min(8, stepX));
+  stepZ = Math.max(2.2, Math.min(8, stepZ));
+  for (let x = worldBox.min.x + 2; x <= worldBox.max.x - 2; x += stepX) {
+    for (let z = worldBox.min.z + 2; z <= worldBox.max.z - 2; z += stepZ) {
+      const floors = floorsAt(x, z);
+      for (const y of floors) {
+        rawWaypoints.push(new THREE.Vector3(x, y, z));
       }
     }
-    return best.clone();
+  }
+  const waypoints = rawWaypoints.length ? rawWaypoints : [new THREE.Vector3(0, 0.05, 0)];
+
+  const yBuckets = new Map();
+  for (const w of waypoints) {
+    const k = Math.round(w.y * 2) / 2;
+    yBuckets.set(k, (yBuckets.get(k) || 0) + 1);
+  }
+  let mainY = waypoints[0].y;
+  let mainCount = 0;
+  const scoredY = [];
+  for (const [y, n] of yBuckets) {
+    const band = waypoints.filter((w) => Math.abs(w.y - y) < 1.4).length;
+    scoredY.push({ y, n: band, roof: y > roof - 1.85 });
+    if (n > mainCount) {
+      mainCount = n;
+      mainY = y;
+    }
+  }
+  scoredY.sort((a, b) => b.n - a.n);
+  const groundBand = scoredY.find((s) => !s.roof && s.n >= 16);
+  if (groundBand) mainY = groundBand.y;
+  const mainFloor = waypoints.filter((w) => Math.abs(w.y - mainY) < 1.4);
+  const LINK_R = Math.max(3.15, Math.hypot(stepX, stepZ) * 1.08);
+  const LINK_R2 = LINK_R * LINK_R;
+  const HEADROOM = 2.0;
+
+  function linkCount(w, pool) {
+    let n = 0;
+    for (const o of pool) {
+      if (o === w) continue;
+      const dx = o.x - w.x;
+      const dz = o.z - w.z;
+      if (dx * dx + dz * dz <= LINK_R2 && Math.abs(o.y - w.y) < 1.2) n += 1;
+    }
+    return n;
+  }
+
+  function largestFloor(pool) {
+    const adj = Array.from({ length: pool.length }, () => []);
+    for (let i = 0; i < pool.length; i++) {
+      for (let j = i + 1; j < pool.length; j++) {
+        const dx = pool[i].x - pool[j].x;
+        const dz = pool[i].z - pool[j].z;
+        if (dx * dx + dz * dz <= LINK_R2 && Math.abs(pool[i].y - pool[j].y) < 1.2) {
+          adj[i].push(j);
+          adj[j].push(i);
+        }
+      }
+    }
+    const seen = new Uint8Array(pool.length);
+    let best = pool;
+    let bestN = 0;
+    for (let i = 0; i < pool.length; i++) {
+      if (seen[i]) continue;
+      const stack = [i];
+      seen[i] = 1;
+      const comp = [];
+      while (stack.length) {
+        const cur = stack.pop();
+        comp.push(pool[cur]);
+        for (const n of adj[cur]) {
+          if (seen[n]) continue;
+          seen[n] = 1;
+          stack.push(n);
+        }
+      }
+      if (comp.length > bestN) {
+        bestN = comp.length;
+        best = comp;
+      }
+    }
+    return best;
+  }
+
+  const spawnBand = mainFloor.length > 10 ? mainFloor : waypoints;
+  const spawnLinked = largestFloor(spawnBand);
+  const spawnPool = spawnLinked.length > 10 ? spawnLinked : spawnBand;
+  const neighborN = new Map();
+  for (const w of spawnPool) neighborN.set(w, linkCount(w, spawnPool));
+
+  function standingAt(w) {
+    const gy = groundAt(w.x, w.z, w.y);
+    if (gy == null || Math.abs(gy - w.y) > 0.55) return false;
+    const ceil = ceilingHit(w.x, w.z, gy + 0.16, HEADROOM, true);
+    if (ceil && ceil.point.y - gy < HEADROOM) return false;
+    return !blockedXZ(w.x, w.z, 0.85, gy);
+  }
+
+  function pickSpawn(scoreFn, pool = spawnPool) {
+    const ranked = [];
+    for (const w of pool) {
+      const n = neighborN.get(w) ?? linkCount(w, pool);
+      if (n < 2) continue;
+      ranked.push({ w, s: scoreFn(w) + n * 2.8 });
+    }
+    ranked.sort((a, b) => b.s - a.s);
+    for (const { w } of ranked) {
+      if (!standingAt(w)) continue;
+      return w.clone();
+    }
+    for (const w of pool) {
+      const n = neighborN.get(w) ?? linkCount(w, pool);
+      if (n < 1) continue;
+      if (!standingAt(w)) continue;
+      return w.clone();
+    }
+    const fallback = ranked[0]?.w || pool[0] || waypoints[0] || new THREE.Vector3(0, 0, 0);
+    return fallback.clone();
   }
 
   function padOpen(p) {
@@ -783,7 +986,8 @@ export function buildArena(scene) {
     if (padOpen(p)) return p;
     let best = p;
     let bestD = Infinity;
-    for (const w of waypoints) {
+    const padPool = spawnPool.length ? spawnPool : waypoints;
+    for (const w of padPool) {
       if (!padOpen(w)) continue;
       const d = p.distanceToSquared(w);
       if (d < bestD) {
@@ -794,10 +998,47 @@ export function buildArena(scene) {
     return best.clone();
   }
 
-  let spawnBlue = ensureGroundPad(pickSpawn((w) => -w.x + w.z));
-  let spawnRed = ensureGroundPad(pickSpawn((w) => w.x - w.z));
-  if (spawnBlue.distanceToSquared(spawnRed) < 8 * 8) {
-    spawnRed = ensureGroundPad(pickSpawn((w) => w.distanceToSquared(spawnBlue)));
+  const standPool = spawnPool.filter((w) => (neighborN.get(w) ?? 0) >= 2 && standingAt(w));
+  const vs = standPool.length >= 8 ? standPool : spawnPool;
+  let minSX = Infinity;
+  let maxSX = -Infinity;
+  let minSZ = Infinity;
+  let maxSZ = -Infinity;
+  for (const w of vs) {
+    if (w.x < minSX) minSX = w.x;
+    if (w.x > maxSX) maxSX = w.x;
+    if (w.z < minSZ) minSZ = w.z;
+    if (w.z > maxSZ) maxSZ = w.z;
+  }
+  const alongX = maxSX - minSX >= maxSZ - minSZ;
+  const spawnAnchors = {
+    pvp_map: {
+      blue: new THREE.Vector3(-22.65, 3.18, -7.99),
+      red: new THREE.Vector3(16.16, 2.47, 22.5),
+    },
+    castle_wars: {
+      blue: new THREE.Vector3(-58.9, 5, -6.61),
+      red: new THREE.Vector3(58.82, 5, 8.58),
+    },
+  };
+  const anchors = spawnAnchors[id];
+  let spawnBlue = ensureGroundPad(
+    pickSpawn(
+      (w) => anchors ? -w.distanceToSquared(anchors.blue) * 4 : (alongX ? -w.x : -w.z) + (neighborN.get(w) ?? 0),
+      vs
+    )
+  );
+  let spawnRed = ensureGroundPad(
+    pickSpawn(
+      (w) => anchors
+        ? -w.distanceToSquared(anchors.red) * 4
+        : w.distanceToSquared(spawnBlue) * 1.35 + (alongX ? w.x : w.z) * 10,
+      vs
+    )
+  );
+  const minSep = Math.max(14, spanXZ * 0.28);
+  if (spawnBlue.distanceTo(spawnRed) < minSep) {
+    spawnRed = ensureGroundPad(pickSpawn((w) => w.distanceToSquared(spawnBlue), vs));
   }
 
   const caution = cautionTexture();
@@ -827,10 +1068,11 @@ export function buildArena(scene) {
   spawnPad(spawnRed, TEAM.red);
 
   function pickSite(scoreFn, avoid = [], minDist = 9) {
-    let best = waypoints[0] || new THREE.Vector3();
+    const pool = spawnPool.length ? spawnPool : waypoints;
+    let best = pool[0] || new THREE.Vector3();
     let bestS = -Infinity;
     let found = false;
-    for (const w of waypoints) {
+    for (const w of pool) {
       if (isRoofAt(w.x, w.z, w.y)) continue;
       if (avoid.some((p) => w.distanceTo(p) < minDist)) continue;
       const s = scoreFn(w);
@@ -933,11 +1175,12 @@ export function buildArena(scene) {
     const avoid = [spawnBlue, spawnRed, fromA];
     const wantX = fromA.x >= cx ? -1 : 1;
     const wantZ = fromA.z >= cz ? -1 : 1;
+    const sitePool = spawnPool.length ? spawnPool : waypoints;
 
     const consider = (requireDist) => {
       let best = null;
       let bestS = -Infinity;
-      for (const w of waypoints) {
+      for (const w of sitePool) {
         if (isRoofAt(w.x, w.z, w.y)) continue;
         if (avoid.some((p) => w.distanceTo(p) < 9)) continue;
         const distA = w.distanceTo(fromA);
@@ -998,6 +1241,7 @@ export function buildArena(scene) {
     halfX,
     halfZ,
     waypoints,
+    spawnPool,
     blockedXZ,
     groundAt,
     ceilingAt,
@@ -1010,6 +1254,10 @@ export function buildArena(scene) {
     },
     meshNav: true,
     worldBox,
+    mapId: id,
+    mapScale: MAP_SCALE,
+    camFar,
+    outdoor: true,
   };
 }
 
@@ -1035,33 +1283,25 @@ function isArmorPlate(mat) {
   return lum > 0.28 && sat < 0.22;
 }
 
-function applyTeamLights(root, teamColor, softTint = false) {
+function isAccentMesh(obj, mat) {
+  const name = `${obj.name || ""} ${mat?.name || ""}`.toLowerCase();
+  if (/visor|goggle|lens|led|light|armband|stripe|trim|badge|patch/.test(name)) return true;
+  return isTeamLight(mat);
+}
+
+function applyTeamLights(root, teamColor, _softTint = false) {
   const color = new THREE.Color(teamColor);
-  const glow = color.clone().multiplyScalar(1.15);
   root.traverse((obj) => {
     if (!obj.isMesh) return;
     const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
     for (const m of mats) {
-      if (softTint) {
-        if (!m?.color) continue;
-        m.color.lerp(color, 0.34);
-        m.emissive.copy(color);
-        m.emissiveIntensity = Math.max(m.emissiveIntensity || 0, 0.28);
-        m.needsUpdate = true;
-        continue;
+      if (!m) continue;
+      if (!isAccentMesh(obj, m)) continue;
+      if (m.emissive) {
+        m.emissive.copy(color).multiplyScalar(0.28);
+        m.emissiveIntensity = Math.min(0.55, Math.max(m.emissiveIntensity || 0, 0.28));
       }
-      if (isTeamLight(m)) {
-        m.emissive.copy(glow);
-        m.emissiveIntensity = Math.max(m.emissiveIntensity || 1, 22);
-        m.color.copy(color);
-        if (m.opacity < 1) m.opacity = Math.min(1, m.opacity + 0.15);
-        m.needsUpdate = true;
-        continue;
-      }
-      if (!isArmorPlate(m)) continue;
-      m.color.lerp(color, 0.62);
-      m.emissive.copy(color);
-      m.emissiveIntensity = Math.max(m.emissiveIntensity || 0, 0.55);
+      if (m.color && !m.map && !m.emissiveMap) m.color.lerp(color, 0.35);
       m.needsUpdate = true;
     }
   });
@@ -1097,8 +1337,10 @@ const CLIP_Y = 1.12 * BODY_K;
 const COMMANDO_GAIT = {
   id: "commando",
   hipY: HIP_Y,
-  clipY: CLIP_Y,
+  clipY: 1.28,
   kneeY: 0.44 * BODY_K,
+  shX: 0.18,
+  shY: 1.22,
 };
 
 const PHOENIX_GAIT = {
@@ -1119,7 +1361,7 @@ function phoenixLimb(matName, meshName) {
   return "body";
 }
 
-function attachBodyShaders(root, profile, clipY = 8, holdArms = false) {
+function attachBodyShaders(root, profile, clipY = 8, holdArms = true) {
   const uWalk = { value: 0 };
   const uPhase = { value: 0 };
   const uRun = { value: 0 };
@@ -1130,6 +1372,8 @@ function attachBodyShaders(root, profile, clipY = 8, holdArms = false) {
   const uHold = { value: holdArms ? 1 : 0 };
   const bk = BODY_K.toFixed(6);
   const ky = profile.kneeY.toFixed(5);
+  const sx = (profile.shX ?? 0.18).toFixed(5);
+  const sy = (profile.shY ?? 1.22).toFixed(5);
   root.traverse((obj) => {
     if (!obj.isMesh) return;
     const matName = Array.isArray(obj.material)
@@ -1148,8 +1392,9 @@ function attachBodyShaders(root, profile, clipY = 8, holdArms = false) {
         shader.uniforms.uClipY = uClipY;
         shader.uniforms.uCrouch = uCrouch;
         shader.uniforms.uLookDown = uLookDown;
+        shader.uniforms.uHold = uHold;
         shader.vertexShader =
-          "uniform float uWalk;\nuniform float uPhase;\nuniform float uRun;\nuniform float uHipY;\nuniform float uClipY;\nuniform float uCrouch;\nuniform float uLookDown;\nvarying float vBodyY;\n" +
+          "uniform float uWalk;\nuniform float uPhase;\nuniform float uRun;\nuniform float uHipY;\nuniform float uClipY;\nuniform float uCrouch;\nuniform float uLookDown;\nuniform float uHold;\nvarying float vBodyY;\nvarying float vBodyX;\n" +
           shader.vertexShader.replace(
             "#include <begin_vertex>",
             `
@@ -1163,12 +1408,12 @@ function attachBodyShaders(root, profile, clipY = 8, holdArms = false) {
 
             float step = sin(uPhase);
             float bob = abs(step);
-            transformed.y += loc * mix(0.014, 0.032, run) * bk * bob;
-            transformed.x += step * mix(0.008, 0.02, run) * bk * loc * smoothstep(0.32 * bk, 1.12 * bk, position.y);
-            transformed.z += mix(0.0, 0.008, run) * bk * loc * smoothstep(uHipY, 1.38 * bk, position.y);
+            transformed.y += loc * mix(0.02, 0.042, run) * bk * bob;
+            transformed.x += step * mix(0.01, 0.024, run) * bk * loc * smoothstep(0.32 * bk, 1.12 * bk, position.y);
+            transformed.z += mix(0.0, 0.012, run) * bk * loc * smoothstep(uHipY, 1.38 * bk, position.y);
 
             if (position.y > uHipY + 0.04 * bk && abs(position.x) < 0.22 * bk) {
-              float twist = -step * mix(0.07, 0.16, run) * loc;
+              float twist = -step * mix(0.08, 0.18, run) * loc;
               float ct = cos(twist);
               float st = sin(twist);
               transformed = vec3(transformed.x * ct + transformed.z * st, transformed.y, -transformed.x * st + transformed.z * ct);
@@ -1180,7 +1425,7 @@ function attachBodyShaders(root, profile, clipY = 8, holdArms = false) {
               float gait = step * side;
               float fwd = max(0.0, -gait);
               float back = max(0.0, gait);
-              float swing = mix(0.72, 1.12, run) * loc;
+              float swing = mix(0.82, 1.22, run) * loc;
               float ang = gait * swing + uCrouch * 0.72;
               float hipY = uHipY - uCrouch * 0.52 * bk * squat;
               vec3 p = transformed;
@@ -1191,8 +1436,8 @@ function attachBodyShaders(root, profile, clipY = 8, holdArms = false) {
 
               float kneeH = ${ky} - uCrouch * 0.22 * bk;
               if (position.y < kneeH) {
-                float flex = fwd * mix(0.85, 1.28, run) * loc;
-                flex += back * mix(0.16, 0.38, run) * loc;
+                float flex = fwd * mix(0.95, 1.42, run) * loc;
+                flex += back * mix(0.2, 0.42, run) * loc;
                 flex += uCrouch * 0.35;
                 float ky = kneeH - hipY;
                 vec3 k = p;
@@ -1205,26 +1450,59 @@ function attachBodyShaders(root, profile, clipY = 8, holdArms = false) {
               }
 
               float foot = 1.0 - smoothstep(0.02 * bk, 0.18 * bk, position.y);
-              p.y += fwd * mix(0.08, 0.18, run) * bk * loc * foot;
-              p.y -= back * mix(0.0, 0.012, run) * bk * loc * foot;
-              p.z += gait * mix(0.05, 0.1, run) * bk * loc;
+              p.y += fwd * mix(0.09, 0.2, run) * bk * loc * foot;
+              p.y -= back * mix(0.0, 0.014, run) * bk * loc * foot;
+              p.z += gait * mix(0.06, 0.12, run) * bk * loc;
               transformed = mix(transformed, vec3(p.x, p.y + hipY, p.z), legMask);
             }
+
+            float hold = clamp(uHold, 0.0, 1.0);
+            float armMask = smoothstep(0.10, 0.17, abs(position.x)) * smoothstep(uHipY + 0.04, uHipY + 0.22, position.y);
+            if (armMask * hold > 0.001) {
+              float armSide = position.x >= 0.0 ? 1.0 : -1.0;
+              vec3 sh = vec3(armSide * ${sx}, ${sy}, 0.0);
+              vec3 ap = transformed - sh;
+              float drop = mix(1.08, 0.92, run);
+              float cd = cos(-drop * armSide);
+              float sd = sin(-drop * armSide);
+              ap = vec3(ap.x * cd - ap.y * sd, ap.x * sd + ap.y * cd, ap.z);
+              float yawA = 0.72 * armSide;
+              float cy = cos(yawA);
+              float sya = sin(yawA);
+              ap = vec3(ap.x * cy + ap.z * sya, ap.y, -ap.x * sya + ap.z * cy);
+              float reach = length(ap);
+              if (reach > 0.22) {
+                float elbow = mix(0.95, 0.72, run);
+                float ce = cos(-elbow * armSide);
+                float se = sin(-elbow * armSide);
+                vec3 ep = ap;
+                ep.y += 0.06;
+                ep = vec3(ep.x * ce - ep.y * se, ep.x * se + ep.y * ce, ep.z);
+                ep.y -= 0.06;
+                ap = mix(ap, ep, smoothstep(0.20, 0.32, reach));
+              }
+              float sway = step * mix(0.05, 0.1, run) * loc * armSide;
+              float cs = cos(sway);
+              float ss = sin(sway);
+              ap = vec3(ap.x, ap.y * cs - ap.z * ss, ap.y * ss + ap.z * cs);
+              transformed = mix(transformed, ap + sh, armMask * hold);
+            }
             vBodyY = position.y;
+            vBodyX = position.x;
             `
           );
         shader.fragmentShader =
-          "uniform float uClipY;\nvarying float vBodyY;\n" +
+          "uniform float uClipY;\nvarying float vBodyY;\nvarying float vBodyX;\n" +
           shader.fragmentShader.replace(
             "void main() {",
             "void main() {\n  if (vBodyY > uClipY) discard;"
           );
       };
-      m.customProgramCacheKey = () => `${profile.id}-${profile.hipY.toFixed(3)}-${clipY.toFixed(2)}-gait`;
+      m.customProgramCacheKey = () => `${profile.id}-${profile.hipY.toFixed(3)}-${clipY.toFixed(2)}-gait-arms`;
       m.needsUpdate = true;
     }
   });
-  return { uWalk, uPhase, uRun, uHipY, uClipY, uCrouch, uLookDown };
+  return { uWalk, uPhase, uRun, uHipY, uClipY, uCrouch, uLookDown, uHold };
 }
 
 function mergeBakedMeshes(root) {
@@ -1369,174 +1647,289 @@ function bakeCommando() {
   return baked;
 }
 
-/** @type {THREE.Group | null} */
-let phoenixBaked = null;
+const PHOENIX_BONES = {
+  pelvis: "pelvis_01",
+  upLegR: "leg_upper_R_02",
+  loLegR: "leg_lower_R_05",
+  ankleR: "ankle_R_06",
+  ballR: "ball_R_07",
+  upLegL: "leg_upper_L_09",
+  loLegL: "leg_lower_L_012",
+  ankleL: "ankle_L_013",
+  ballL: "ball_L_014",
+  spine0: "spine_0_016",
+  spine2: "spine_2_018",
+  spine3: "spine_3_020",
+  clavR: "clavicle_R_021",
+  upArmR: "arm_upper_R_022",
+  loArmR: "arm_lower_R_025",
+  handR: "hand_R_028",
+  weaponR: "weapon_hand_R_030",
+  clavL: "clavicle_L_051",
+  upArmL: "arm_upper_L_052",
+  loArmL: "arm_lower_L_055",
+  handL: "hand_L_058",
+  neck: "neck_0_082",
+  head: "head_0_083",
+};
 
-function bakeSkinnedGeometry(mesh) {
-  const geo = mesh.geometry.clone();
-  const pos = geo.attributes.position;
-  const skinIndex = geo.attributes.skinIndex;
-  const skinWeight = geo.attributes.skinWeight;
-  if (!skinIndex || !skinWeight || !mesh.skeleton) {
-    geo.applyMatrix4(mesh.matrixWorld);
-    return geo;
-  }
-  mesh.skeleton.update();
-  const boneMat = mesh.skeleton.boneMatrices;
-  const bind = mesh.bindMatrix;
-  const bindInv = mesh.bindMatrixInverse;
-  const skinVertex = new THREE.Vector4();
-  const skinned = new THREE.Vector4();
-  const tmp = new THREE.Vector4();
-  const bm = new THREE.Matrix4();
-  for (let i = 0; i < pos.count; i++) {
-    skinVertex.set(pos.getX(i), pos.getY(i), pos.getZ(i), 1).applyMatrix4(bind);
-    skinned.set(0, 0, 0, 0);
-    for (let j = 0; j < 4; j++) {
-      const w = skinWeight.getComponent(i, j);
-      if (w === 0) continue;
-      bm.fromArray(boneMat, skinIndex.getComponent(i, j) * 16);
-      tmp.copy(skinVertex).applyMatrix4(bm).multiplyScalar(w);
-      skinned.add(tmp);
-    }
-    skinned.applyMatrix4(bindInv);
-    pos.setXYZ(i, skinned.x, skinned.y, skinned.z);
-  }
-  geo.deleteAttribute("skinIndex");
-  geo.deleteAttribute("skinWeight");
-  geo.applyMatrix4(mesh.matrixWorld);
-  geo.computeVertexNormals();
-  return geo;
+const _axis = new THREE.Vector3();
+const _side = new THREE.Vector3();
+const _fwd = new THREE.Vector3();
+const _up = new THREE.Vector3(0, 1, 0);
+const _mid = new THREE.Vector3();
+const _left = new THREE.Vector3();
+const _right = new THREE.Vector3();
+
+function sm01(a, b, x) {
+  const t = THREE.MathUtils.clamp((x - a) / Math.max(1e-4, b - a), 0, 1);
+  return t * t * (3 - 2 * t);
 }
 
-function measurePhoenixGait(baked) {
-  const box = new THREE.Box3().setFromObject(baked);
-  const h = Math.max(0.001, box.max.y - box.min.y);
-  let hipSum = 0;
-  let hipN = 0;
-  let shX = 0;
-  let shY = 0;
-  let shZ = 0;
-  let shN = 0;
-  for (const mesh of baked.children) {
-    const pos = mesh.geometry.attributes.position;
-    const limb = mesh.userData.limb;
-    for (let i = 0; i < pos.count; i++) {
-      const x = pos.getX(i);
-      const y = pos.getY(i);
-      const z = pos.getZ(i);
-      const ax = Math.abs(x);
-      if (limb === "legs" && ax < 0.12 && y > h * 0.48 && y < h * 0.62) {
-        hipSum += y;
-        hipN++;
-      }
-      if (limb === "body" && ax > 0.14 && ax < 0.22 && y > 1.18 && y < 1.32) {
-        shX += ax;
-        shY += y;
-        shZ += z;
-        shN++;
-      }
+function collectPhoenixBones(root) {
+  const found = {};
+  const names = new Set(Object.values(PHOENIX_BONES));
+  root.traverse((o) => {
+    if (!o.isBone || !names.has(o.name)) return;
+    o.userData.restQ = o.quaternion.clone();
+    o.userData.restS = o.scale.clone();
+    for (const [key, name] of Object.entries(PHOENIX_BONES)) {
+      if (name === o.name) found[key] = o;
     }
-  }
-  PHOENIX_GAIT.hipY = hipN ? hipSum / hipN : h * 0.55;
-  PHOENIX_GAIT.kneeY = PHOENIX_GAIT.hipY * 0.54;
-  if (shN) {
-    PHOENIX_GAIT.shX = shX / shN;
-    PHOENIX_GAIT.shY = shY / shN;
-    PHOENIX_GAIT.shZ = shZ / shN;
-  }
+  });
+  return found;
 }
 
-function bakePhoenix() {
-  if (phoenixBaked) return phoenixBaked;
+function resetBone(bone) {
+  if (!bone?.userData.restQ) return;
+  bone.quaternion.copy(bone.userData.restQ);
+  if (bone.userData.restS) bone.scale.copy(bone.userData.restS);
+}
+
+function stubWalkUniforms() {
+  return {
+    uWalk: { value: 0 },
+    uPhase: { value: 0 },
+    uRun: { value: 0 },
+    uCrouch: { value: 0 },
+    uClipY: { value: 8 },
+    uLookDown: { value: 0 },
+    uHold: { value: 0 },
+  };
+}
+
+function createPhoenixRig() {
   if (!phoenixTemplate) throw new Error("Call loadGameAssets() before createFighter()");
-  phoenixTemplate.updateMatrixWorld(true);
-  phoenixTemplate.traverse((mesh) => {
-    if (mesh.isSkinnedMesh) mesh.skeleton.update();
+  const wrap = new THREE.Group();
+  const clone = cloneSkinned(phoenixTemplate);
+  wrap.add(clone);
+  clone.traverse((o) => {
+    if (!o.isMesh) return;
+    o.castShadow = false;
+    o.receiveShadow = false;
+    o.frustumCulled = false;
   });
-  const baked = new THREE.Group();
-  phoenixTemplate.traverse((mesh) => {
-    if (!mesh.isMesh) return;
-    if (/pcube|helper|collision|hitbox/i.test(mesh.name || "")) return;
-    const geo = mesh.isSkinnedMesh ? bakeSkinnedGeometry(mesh) : mesh.geometry.clone().applyMatrix4(mesh.matrixWorld);
-    geo.computeBoundingBox();
-    const size = geo.boundingBox.getSize(new THREE.Vector3());
-    if (size.length() < 0.002) return;
-    if ((geo.attributes.position?.count || 0) < 12) return;
-    const matName = Array.isArray(mesh.material)
-      ? mesh.material.map((m) => m?.name).join(" ")
-      : mesh.material?.name;
-    const mat = Array.isArray(mesh.material)
-      ? mesh.material.map((m) => cheapMat(m))
-      : cheapMat(mesh.material);
-    const nm = new THREE.Mesh(geo, mat);
-    nm.name = mesh.name;
-    nm.userData.limb = phoenixLimb(matName, mesh.name);
-    nm.castShadow = false;
-    nm.receiveShadow = false;
-    baked.add(nm);
-  });
-  baked.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(baked);
+  wrap.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(wrap);
   const s = COMMANDO_H / Math.max(0.001, box.max.y - box.min.y);
-  const center = box.getCenter(new THREE.Vector3());
-  const xform = new THREE.Matrix4()
-    .makeScale(s, s, s)
-    .multiply(new THREE.Matrix4().makeTranslation(-center.x, -box.min.y, -center.z));
-  for (const mesh of baked.children) mesh.geometry.applyMatrix4(xform);
-  const footY = 0.14 * BODY_K;
-  let footX = 0;
-  let footZ = 0;
-  let footN = 0;
-  for (const mesh of baked.children) {
-    const pos = mesh.geometry.attributes.position;
-    for (let i = 0; i < pos.count; i++) {
-      if (pos.getY(i) > footY) continue;
-      footX += pos.getX(i);
-      footZ += pos.getZ(i);
-      footN++;
-    }
+  wrap.scale.setScalar(s);
+  wrap.updateMatrixWorld(true);
+  const after = new THREE.Box3().setFromObject(wrap);
+  wrap.position.set(-(after.min.x + after.max.x) * 0.5, -after.min.y, -(after.min.z + after.max.z) * 0.5);
+  wrap.updateMatrixWorld(true);
+  const bones = collectPhoenixBones(wrap);
+  if (bones.pelvis) {
+    bones.pelvis.getWorldPosition(_mid);
+    wrap.position.x -= _mid.x;
+    wrap.position.z -= _mid.z;
   }
-  if (footN > 0) {
-    const recenter = new THREE.Matrix4().makeTranslation(-footX / footN, 0, -footZ / footN);
-    for (const mesh of baked.children) mesh.geometry.applyMatrix4(recenter);
+  wrap.updateMatrixWorld(true);
+  const floor = new THREE.Box3().setFromObject(wrap);
+  wrap.position.y -= floor.min.y;
+  wrap.updateMatrixWorld(true);
+  wrap.userData.bones = bones;
+  wrap.userData.skeleton = null;
+  wrap.traverse((o) => {
+    if (o.isSkinnedMesh && o.skeleton) wrap.userData.skeleton = o.skeleton;
+  });
+  return wrap;
+}
+
+function poseAxes(rig) {
+  const pose = rig.userData.pose;
+  pose.updateWorldMatrix(true, false);
+  _side.set(1, 0, 0).transformDirection(pose.matrixWorld).normalize();
+  _fwd.set(0, 0, -1).transformDirection(pose.matrixWorld).normalize();
+}
+
+function posePhoenixHold(b, loc, runK, up, plantK, phase = 0) {
+  const stride = Math.sin(phase);
+  const sway = stride * THREE.MathUtils.lerp(0.025, 0.065, runK) * loc;
+  // Pose the model's real shoulders, elbows and wrists around the blaster.
+  // The support arm reaches farther forward while the trigger elbow stays tucked.
+  b.clavR?.rotateOnWorldAxis(_up, -0.24 * up);
+  b.clavL?.rotateOnWorldAxis(_up, 0.34 * up);
+  b.clavR?.rotateOnWorldAxis(_side, 0.08 * up);
+  b.clavL?.rotateOnWorldAxis(_side, 0.12 * up);
+  b.upArmR?.rotateOnWorldAxis(_up, THREE.MathUtils.lerp(0.18, 1.02, up) + plantK * 0.2);
+  b.upArmR?.rotateOnWorldAxis(_side, THREE.MathUtils.lerp(0.1, 0.58, up) + plantK * 0.35);
+  b.loArmR?.rotateOnWorldAxis(_up, THREE.MathUtils.lerp(0.16, 1.16, up));
+  b.loArmR?.rotateOnWorldAxis(_side, 0.24 * up);
+  b.handR?.rotateOnWorldAxis(_up, 0.16 * up);
+  b.handR?.rotateOnWorldAxis(_side, 0.16 * up);
+  b.upArmL?.rotateOnWorldAxis(_up, THREE.MathUtils.lerp(-0.16, -1.16, up) - plantK * 0.2);
+  b.upArmL?.rotateOnWorldAxis(_side, THREE.MathUtils.lerp(0.08, 0.48, up) + plantK * 0.35);
+  b.loArmL?.rotateOnWorldAxis(_up, THREE.MathUtils.lerp(-0.14, -1.28, up));
+  b.loArmL?.rotateOnWorldAxis(_side, 0.3 * up);
+  b.handL?.rotateOnWorldAxis(_up, -0.2 * up);
+  b.handL?.rotateOnWorldAxis(_side, 0.1 * up);
+  if (loc > 0.02) {
+    b.upArmR?.rotateOnWorldAxis(_fwd, sway * 0.45);
+    b.upArmL?.rotateOnWorldAxis(_fwd, -sway * 0.35);
   }
-  baked.updateMatrixWorld(true);
-  const fitBox = new THREE.Box3().setFromObject(baked);
-  const fitH = Math.max(0.001, fitBox.max.y - fitBox.min.y);
-  const fit = COMMANDO_H / fitH;
-  const settle = new THREE.Matrix4()
-    .makeScale(fit, fit, fit)
-    .multiply(new THREE.Matrix4().makeTranslation(0, -fitBox.min.y, 0));
-  for (const mesh of baked.children) {
-    mesh.geometry.applyMatrix4(settle);
-    mesh.geometry.computeBoundingBox();
-    mesh.geometry.computeBoundingSphere();
+}
+
+function posePhoenixDeath(rig, t) {
+  const body = rig.userData.body;
+  const b = body?.userData?.bones;
+  if (!b?.upLegR) return;
+  for (const bone of Object.values(b)) resetBone(bone);
+  poseAxes(rig);
+  const kneel = sm01(0, 0.42, t);
+  const crumple = sm01(0.42, 0.86, t);
+  const flop = sm01(0.86, 1.32, t);
+  const fold = kneel * 1.18 + crumple * 0.22;
+  b.upLegR.rotateOnWorldAxis(_side, fold);
+  b.upLegL.rotateOnWorldAxis(_side, fold);
+  b.loLegR?.rotateOnWorldAxis(_side, -1.45 * kneel - 0.2 * crumple);
+  b.loLegL?.rotateOnWorldAxis(_side, -1.45 * kneel - 0.2 * crumple);
+  b.ankleR?.rotateOnWorldAxis(_side, 0.35 * kneel);
+  b.ankleL?.rotateOnWorldAxis(_side, 0.35 * kneel);
+  b.pelvis?.rotateOnWorldAxis(_side, 0.3 * kneel + 0.32 * crumple);
+  b.spine0?.rotateOnWorldAxis(_side, 0.12 * kneel + 0.28 * crumple);
+  b.spine2?.rotateOnWorldAxis(_side, 0.22 * kneel + 0.42 * crumple);
+  b.spine3?.rotateOnWorldAxis(_side, 0.1 * kneel + 0.26 * crumple);
+  b.upArmR?.rotateOnWorldAxis(_side, 0.35 * kneel + 0.85 * crumple);
+  b.upArmL?.rotateOnWorldAxis(_side, 0.35 * kneel + 0.85 * crumple);
+  b.loArmR?.rotateOnWorldAxis(_up, 0.4 + 0.5 * crumple);
+  b.loArmL?.rotateOnWorldAxis(_up, -0.4 - 0.5 * crumple);
+  body.position.y = -0.25 * kneel - 0.1 * crumple - 0.03 * flop;
+  body.updateMatrixWorld(true);
+  body.userData.skeleton?.update();
+  const gun = rig.userData.gun;
+  if (gun) gun.visible = flop < 0.55;
+}
+
+function posePhoenix(rig, amt, phase, crouch, run, raise = 1, plant = 0, deathT = 0) {
+  const body = rig.userData.body;
+  const b = body?.userData?.bones;
+  if (!b?.upArmR) return;
+  if (deathT > 0) {
+    posePhoenixDeath(rig, deathT);
+    return;
   }
-  measurePhoenixGait(baked);
-  mergeBakedMeshes(baked);
-  phoenixBaked = baked;
-  return baked;
+  for (const bone of Object.values(b)) resetBone(bone);
+  const hideHead = rig.userData.fpsHideHead;
+  if (hideHead) {
+    if (b.head) b.head.scale.setScalar(0.01);
+    if (b.neck) b.neck.scale.setScalar(0.01);
+  }
+  poseAxes(rig);
+  const plantK = THREE.MathUtils.clamp(plant, 0, 1);
+  const loc = THREE.MathUtils.clamp(amt, 0, 1) * (1 - plantK * 0.9);
+  const runK = THREE.MathUtils.clamp(run, 0, 1) * loc;
+  const up = THREE.MathUtils.clamp(raise, 0, 1) * (1 - plantK * 0.82);
+  const squat = THREE.MathUtils.clamp(crouch, 0, 1) + plantK * 0.82;
+  posePhoenixHold(b, loc, runK, up, plantK, phase);
+  const gait = Math.sin(phase);
+  const swing = THREE.MathUtils.lerp(0.48, 0.92, runK) * loc;
+  const flex = THREE.MathUtils.lerp(0.42, 0.88, runK) * loc;
+  b.upLegR?.rotateOnWorldAxis(_side, gait * swing + squat * 0.55);
+  b.upLegL?.rotateOnWorldAxis(_side, -gait * swing + squat * 0.55);
+  b.loLegR?.rotateOnWorldAxis(_side, -Math.max(0.12, gait) * flex - squat * 0.7);
+  b.loLegL?.rotateOnWorldAxis(_side, -Math.max(0.12, -gait) * flex - squat * 0.7);
+  b.ankleR?.rotateOnWorldAxis(_side, Math.max(0, -gait) * 0.28 * loc);
+  b.ankleL?.rotateOnWorldAxis(_side, Math.max(0, gait) * 0.28 * loc);
+  b.pelvis?.rotateOnWorldAxis(_up, -gait * THREE.MathUtils.lerp(0.06, 0.12, runK) * loc);
+  b.spine2?.rotateOnWorldAxis(_up, -gait * 0.08 * loc);
+  b.spine2?.rotateOnWorldAxis(_side, 0.08 * loc * (0.4 + runK) + squat * 0.22);
+  body.position.y = -squat * 0.32 + Math.abs(gait) * THREE.MathUtils.lerp(0.018, 0.034, runK) * loc;
+  body.updateMatrixWorld(true);
+  body.userData.skeleton?.update();
+  const gun = rig.userData.gun;
+  if (gun && b.handR) {
+    const hold = b.weaponR || b.handR;
+    hold.getWorldPosition(_right);
+    if (b.handL) b.handL.getWorldPosition(_left);
+    else _left.copy(_right);
+    _mid.addVectors(_left, _right).multiplyScalar(0.5).lerp(_right, 0.28);
+    rig.userData.pose.worldToLocal(_mid);
+    gun.position.copy(_mid);
+    gun.rotation.set(0.1, 0.04, 0.05);
+    gun.visible = plantK < 0.88;
+  }
+}
+
+function posePhoenixDance(rig, t) {
+  const body = rig.userData.body;
+  const b = body?.userData?.bones;
+  if (!b?.upArmR) return;
+  for (const bone of Object.values(b)) resetBone(bone);
+  poseAxes(rig);
+  const step = t * ((102 / 60) * Math.PI * 2);
+  const leftLeg = Math.sin(step);
+  const rightLeg = Math.sin(step + Math.PI);
+  const armR = Math.sin(step + 0.55);
+  const armL = Math.sin(step * 0.92 + Math.PI + 0.8);
+  const shoulder = Math.sin(step * 0.5 + 0.9);
+  const kneeL = Math.max(0, Math.sin(step + 0.22));
+  const kneeR = Math.max(0, Math.sin(step + Math.PI + 0.4));
+  b.upLegR?.rotateOnWorldAxis(_side, rightLeg * 0.52 + 0.1);
+  b.upLegL?.rotateOnWorldAxis(_side, leftLeg * 0.58 + 0.08);
+  b.loLegR?.rotateOnWorldAxis(_side, -kneeR * 0.92);
+  b.loLegL?.rotateOnWorldAxis(_side, -kneeL * 0.7);
+  b.ankleR?.rotateOnWorldAxis(_side, Math.max(0, -rightLeg) * 0.22);
+  b.ankleL?.rotateOnWorldAxis(_side, Math.max(0, -leftLeg) * 0.18);
+  b.clavR?.rotateOnWorldAxis(_fwd, shoulder * 0.2);
+  b.clavL?.rotateOnWorldAxis(_fwd, -shoulder * 0.12);
+  b.upArmR?.rotateOnWorldAxis(_side, 0.42 + Math.abs(armR) * 0.5);
+  b.upArmR?.rotateOnWorldAxis(_fwd, armR * 0.62);
+  b.loArmR?.rotateOnWorldAxis(_up, 0.55 + armR * 0.42);
+  b.upArmL?.rotateOnWorldAxis(_side, 0.18 + Math.abs(armL) * 0.38);
+  b.upArmL?.rotateOnWorldAxis(_fwd, armL * 0.95);
+  b.loArmL?.rotateOnWorldAxis(_up, -0.62 + armL * 0.28);
+  b.handL?.rotateOnWorldAxis(_side, -0.15 + armL * 0.12);
+  b.spine2?.rotateOnWorldAxis(_up, shoulder * 0.14);
+  b.spine2?.rotateOnWorldAxis(_side, 0.06 + Math.abs(leftLeg) * 0.04);
+  b.pelvis?.rotateOnWorldAxis(_up, Math.sin(step * 0.5) * 0.12);
+  b.head?.rotateOnWorldAxis(_side, Math.sin(step * 0.5) * 0.08);
+  body.position.y = -Math.max(kneeL, kneeR) * 0.07;
+  body.updateMatrixWorld(true);
+  body.userData.skeleton?.update();
+  const gun = rig.userData.gun;
+  if (gun) gun.visible = false;
 }
 
 export function createFighter(team, isPlayerView = false) {
   const teamId = team === TEAM.red || team === "red" ? "red" : "blue";
   const teamColor = TEAM[teamId];
-  const isPhoenix = teamId === "red" && Boolean(phoenixTemplate);
-  if (!commandoTemplate && !isPhoenix) throw new Error("Call loadGameAssets() before createFighter()");
+  // One consistent, fully rigged character for both teams. The static commando
+  // remains an asset fallback only; Phoenix supplies the existing real arms,
+  // hands and leg skeleton required for believable weapon and locomotion poses.
+  const isPhoenix = Boolean(phoenixTemplate);
+  if (!isPhoenix && !commandoTemplate) throw new Error("Call loadGameAssets() before createFighter()");
   const profile = isPhoenix ? PHOENIX_GAIT : COMMANDO_GAIT;
   const g = new THREE.Group();
-  const body = (isPhoenix ? bakePhoenix() : bakeCommando()).clone(true);
+  const body = isPhoenix ? createPhoenixRig() : bakeCommando().clone(true);
   cloneMaterials(body);
-  if (!isPhoenix) applyTeamLights(body, teamColor, false);
-  const fpsClip = isPlayerView ? profile.clipY : 8;
-  const walkUniforms = attachBodyShaders(body, profile, fpsClip);
-  if (isPlayerView) body.visible = false;
+  applyTeamLights(body, teamColor);
+  const fpsClip = isPlayerView && !isPhoenix ? 0.12 : 8;
+  const walkUniforms = isPhoenix ? stubWalkUniforms() : attachBodyShaders(body, profile, fpsClip, true);
   const pose = new THREE.Group();
   let gun = null;
   if (!isPlayerView) {
-    gun = createWeapon(DEFAULT_WEAPON, true);
-    gun.position.set(0.14 * BODY_K, 0.98 * BODY_K, -0.28 * BODY_K);
+    gun = createMarker(true);
+    gun.position.set(0.12 * BODY_K, 1.0 * BODY_K, -0.31 * BODY_K);
     gun.rotation.set(0.12, 0, 0.06);
     pose.add(gun);
   }
@@ -1562,10 +1955,21 @@ export function createFighter(team, isPlayerView = false) {
     gun,
     kind: profile.id,
     fpsView: isPlayerView,
-    fpsClipY: isPlayerView ? profile.clipY : null,
+    fpsClipY: isPlayerView && !isPhoenix ? 0.12 : isPlayerView ? 8 : null,
+    fpsHideHead: Boolean(isPlayerView),
+    poseSkeleton: isPhoenix
+      ? (amt, phase, crouch, run, up, plant, deathT) => posePhoenix(g, amt, phase, crouch, run, up, plant, deathT)
+      : null,
+    dancePose: isPhoenix ? (t) => posePhoenixDance(g, t) : null,
   };
+  if (isPhoenix) posePhoenix(g, 0, 0, 0, 0, 1, 0, 0);
   if (isPlayerView) {
     g.frustumCulled = false;
+    body.visible = false;
+    body.traverse((obj) => {
+      obj.layers.set(2);
+      obj.frustumCulled = false;
+    });
     g.traverse((obj) => {
       obj.frustumCulled = false;
     });
@@ -1611,19 +2015,46 @@ export function createBomb() {
   return g;
 }
 
-export function createMarker(world = false, opts = {}) {
-  const id = opts.weapon || DEFAULT_WEAPON;
-  if (weaponTemplates[id] || weaponTemplates.glock) return createWeapon(id, world);
+function brightenViewmodel(root) {
+  const floor = new THREE.Color(0x6e6458);
+  root.traverse((obj) => {
+    if (!obj.isMesh) return;
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+    for (const m of mats) {
+      if (!m) continue;
+      if (m.color) {
+        const lum = m.color.r * 0.3 + m.color.g * 0.5 + m.color.b * 0.2;
+        if (lum < 0.16) m.color.copy(floor);
+        else m.color.multiplyScalar(1.45);
+      }
+      if (m.emissive) {
+        m.emissive.setHex(0x3a342c);
+        m.emissiveIntensity = Math.max(m.emissiveIntensity || 0, 0.42);
+      }
+      m.needsUpdate = true;
+    }
+  });
+}
+
+export function createMarker(world = false) {
   if (!blasterTemplate) throw new Error("Call loadGameAssets() before createMarker()");
   const g = new THREE.Group();
   const gun = blasterTemplate.clone(true);
   cloneMaterials(gun);
+  brightenViewmodel(gun);
   gun.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(gun);
   const len = Math.max(0.05, box.max.z - box.min.z, box.max.x - box.min.x);
-  gun.scale.setScalar((world ? 0.76 * BODY_K : 0.6) / len);
+  gun.scale.setScalar((world ? 0.54 * BODY_K : 0.26) / len);
   gun.rotation.y = Math.PI;
   g.add(gun);
+  gun.updateMatrixWorld(true);
+  if (!world) {
+    const fitted = new THREE.Box3().setFromObject(g);
+    gun.position.x -= (fitted.min.x + fitted.max.x) * 0.5;
+    gun.position.y -= (fitted.min.y + fitted.max.y) * 0.5;
+    gun.position.z -= fitted.max.z;
+  }
   gun.updateMatrixWorld(true);
   const after = new THREE.Box3().setFromObject(g);
   g.userData.muzzle = new THREE.Vector3(
@@ -1631,10 +2062,15 @@ export function createMarker(world = false, opts = {}) {
     (after.min.y + after.max.y) * 0.5 + 0.015,
     after.min.z - 0.02
   );
-  g.userData.weaponId = id;
+  g.userData.weaponId = "blaster";
+  g.userData.adsFov = 64;
+  g.userData.hipPos = new THREE.Vector3(0.5, -0.48, -0.82);
+  g.userData.adsPos = new THREE.Vector3(0.24, -0.34, -0.74);
+  g.userData.adsQuat = new THREE.Quaternion();
+  g.userData.sight = new THREE.Vector3(0, 0.02, 0.08);
   if (!world) {
-    g.position.set(0.3, -0.24, -0.48);
-    g.rotation.set(0.05, 0.14, 0.03);
+    g.position.copy(g.userData.hipPos);
+    g.rotation.set(0.05, 0.14, 0.035);
     g.frustumCulled = false;
     g.traverse((obj) => {
       obj.frustumCulled = false;
@@ -1666,7 +2102,7 @@ function flattenGunMeshes(src) {
   const g = new THREE.Group();
   src.traverse((mesh) => {
     if (!mesh.isMesh || !mesh.geometry) return;
-    const geo = mesh.isSkinnedMesh ? bakeSkinnedGeometry(mesh) : mesh.geometry.clone().applyMatrix4(mesh.matrixWorld);
+    const geo = mesh.geometry.clone().applyMatrix4(mesh.matrixWorld);
     const nm = new THREE.Mesh(geo, mesh.material);
     nm.name = mesh.name;
     nm.castShadow = false;
@@ -1725,7 +2161,7 @@ function xySpanInZ(g, z0, z1) {
 }
 
 function detectMuzzleSign(g) {
-  const front = namedAxisAvg(g, /barrel|muzzle|slide|innerpart|bolt|fs_low/i, "z");
+  const front = namedAxisAvg(g, /barrel|muzzle|slide|innerpart|bolt/i, "z");
   const rear = namedAxisAvg(g, /stock|handle|grip/i, "z");
   if (front != null && rear != null && Math.abs(front - rear) > 1e-4) return Math.sign(front - rear);
   if (front != null && Math.abs(front) > 1e-4) return Math.sign(front);
@@ -1736,11 +2172,32 @@ function detectMuzzleSign(g) {
   return tPos < tNeg ? 1 : -1;
 }
 
+function zSpanAbove(g, predY) {
+  let minZ = Infinity;
+  let maxZ = -Infinity;
+  g.traverse((mesh) => {
+    if (!mesh.isMesh || !mesh.geometry?.attributes?.position) return;
+    const pos = mesh.geometry.attributes.position;
+    const step = Math.max(1, (pos.count / 2500) | 0);
+    for (let i = 0; i < pos.count; i += step) {
+      if (!predY(pos.getY(i))) continue;
+      const z = pos.getZ(i);
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
+    }
+  });
+  return Number.isFinite(minZ) ? maxZ - minZ : 0;
+}
+
 function detectUpSign(g) {
   const down = namedAxisAvg(g, /mag|magazine|handle|grip/i, "y");
   const up = namedAxisAvg(g, /slide|receiver|barrel|rail|stock/i, "y");
   if (down != null && up != null && Math.abs(up - down) > 1e-4) return Math.sign(up - down);
-  return 1;
+  const box = gunBox(g);
+  const midY = (box.min.y + box.max.y) * 0.5;
+  const high = zSpanAbove(g, (y) => y > midY);
+  const low = zSpanAbove(g, (y) => y < midY);
+  return high >= low ? 1 : -1;
 }
 
 function gunBox(g) {
@@ -1754,14 +2211,106 @@ function centerGun(g) {
   applyGunMatrix(g, new THREE.Matrix4().makeTranslation(-c.x, -c.y, -c.z));
 }
 
-function orientGun(g) {
-  let box = gunBox(g);
-  let size = box.getSize(new THREE.Vector3());
-  if (size.x >= size.y && size.x >= size.z) {
-    applyGunMatrix(g, new THREE.Matrix4().makeRotationY(Math.PI * 0.5));
-  } else if (size.y >= size.x && size.y >= size.z) {
-    applyGunMatrix(g, new THREE.Matrix4().makeRotationX(Math.PI * 0.5));
+function eigenVectors3(cov) {
+  let a = cov.slice();
+  let v = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  for (let iter = 0; iter < 48; iter++) {
+    let p = 0;
+    let q = 1;
+    let max = Math.abs(a[1]);
+    if (Math.abs(a[2]) > max) {
+      max = Math.abs(a[2]);
+      p = 0;
+      q = 2;
+    }
+    if (Math.abs(a[5]) > max) {
+      max = Math.abs(a[5]);
+      p = 1;
+      q = 2;
+    }
+    if (max < 1e-14) break;
+    const app = a[p * 3 + p];
+    const aqq = a[q * 3 + q];
+    const apq = a[p * 3 + q];
+    const phi = 0.5 * Math.atan2(2 * apq, aqq - app);
+    const c = Math.cos(phi);
+    const s = Math.sin(phi);
+    const next = a.slice();
+    for (let i = 0; i < 3; i++) {
+      if (i === p || i === q) continue;
+      const aip = a[i * 3 + p];
+      const aiq = a[i * 3 + q];
+      next[i * 3 + p] = next[p * 3 + i] = c * aip - s * aiq;
+      next[i * 3 + q] = next[q * 3 + i] = s * aip + c * aiq;
+    }
+    next[p * 3 + p] = c * c * app - 2 * s * c * apq + s * s * aqq;
+    next[q * 3 + q] = s * s * app + 2 * s * c * apq + c * c * aqq;
+    next[p * 3 + q] = next[q * 3 + p] = 0;
+    a = next;
+    const nv = v.slice();
+    for (let i = 0; i < 3; i++) {
+      const vip = v[i * 3 + p];
+      const viq = v[i * 3 + q];
+      nv[i * 3 + p] = c * vip - s * viq;
+      nv[i * 3 + q] = s * vip + c * viq;
+    }
+    v = nv;
   }
+  const axes = [0, 1, 2].map((i) => ({
+    l: a[i * 3 + i],
+    v: new THREE.Vector3(v[i], v[3 + i], v[6 + i]),
+  }));
+  axes.sort((x, y) => y.l - x.l);
+  return axes;
+}
+
+function pcaAlignGun(g) {
+  const pts = [];
+  g.traverse((mesh) => {
+    if (!mesh.isMesh || !mesh.geometry?.attributes?.position) return;
+    const pos = mesh.geometry.attributes.position;
+    const step = Math.max(1, (pos.count / 4000) | 0);
+    for (let i = 0; i < pos.count; i += step) pts.push(pos.getX(i), pos.getY(i), pos.getZ(i));
+  });
+  const n = pts.length / 3;
+  if (n < 8) return;
+  const mean = [0, 0, 0];
+  for (let i = 0; i < pts.length; i += 3) {
+    mean[0] += pts[i];
+    mean[1] += pts[i + 1];
+    mean[2] += pts[i + 2];
+  }
+  mean[0] /= n;
+  mean[1] /= n;
+  mean[2] /= n;
+  const C = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+  for (let i = 0; i < pts.length; i += 3) {
+    const x = pts[i] - mean[0];
+    const y = pts[i + 1] - mean[1];
+    const z = pts[i + 2] - mean[2];
+    C[0] += x * x;
+    C[1] += x * y;
+    C[2] += x * z;
+    C[4] += y * y;
+    C[5] += y * z;
+    C[8] += z * z;
+  }
+  C[3] = C[1];
+  C[6] = C[2];
+  C[7] = C[5];
+  const axes = eigenVectors3(C);
+  const zv = axes[0].v.normalize();
+  let yv = axes[1].v;
+  yv.sub(zv.clone().multiplyScalar(yv.dot(zv)));
+  if (yv.lengthSq() < 1e-10) yv = new THREE.Vector3(0, 1, 0).cross(zv);
+  yv.normalize();
+  const xv = new THREE.Vector3().crossVectors(yv, zv).normalize();
+  yv.crossVectors(zv, xv).normalize();
+  applyGunMatrix(g, new THREE.Matrix4().makeBasis(xv, yv, zv).invert());
+}
+
+function orientGun(g) {
+  pcaAlignGun(g);
   centerGun(g);
   if (detectMuzzleSign(g) > 0) applyGunMatrix(g, new THREE.Matrix4().makeRotationY(Math.PI));
   if (detectUpSign(g) < 0) applyGunMatrix(g, new THREE.Matrix4().makeRotationZ(Math.PI));
@@ -1801,14 +2350,36 @@ function findGripPoint(g, box) {
   );
 }
 
-function findSightPoint(g, box) {
-  const span = box.max.z - box.min.z;
-  const zA = box.min.z + span * 0.38;
-  const zB = box.min.z + span * 0.88;
+function findFrontSight(g, box) {
+  const span = Math.max(0.04, box.max.z - box.min.z);
+  const zB = box.min.z + span * 0.2;
   return (
-    sampleGunPoint(g, (p) => (p.z < zA || p.z > zB ? -1e9 : p.y * 5 - Math.abs(p.x) * 2.2 - Math.abs(p.z - (zA + zB) * 0.5) * 0.15)) ||
-    new THREE.Vector3(0, box.max.y, box.min.z + span * 0.62)
+    sampleGunPoint(g, (p) => (p.z > zB ? -1e9 : p.y * 8 - Math.abs(p.x) * 5)) ||
+    new THREE.Vector3(0, box.max.y * 0.92, box.min.z + span * 0.08)
   );
+}
+
+function findRearSight(g, box) {
+  const span = Math.max(0.04, box.max.z - box.min.z);
+  const zA = -span * 0.22;
+  const zB = span * 0.1;
+  return (
+    sampleGunPoint(g, (p) => (p.z < zA || p.z > zB ? -1e9 : p.y * 8 - Math.abs(p.x) * 5 - Math.abs(p.z) * 0.35)) ||
+    new THREE.Vector3(0, box.max.y * 0.95, 0)
+  );
+}
+
+function computeAdsPose(rear, front) {
+  const look = rear.clone();
+  look.x *= 0.2;
+  look.y -= Math.max(0.007, Math.abs(rear.y - front.y) * 0.22 + 0.008);
+  const dir = front.clone().sub(look);
+  if (dir.lengthSq() < 1e-8) dir.set(0, 0, -1);
+  else dir.normalize();
+  const q = new THREE.Quaternion().setFromUnitVectors(dir, new THREE.Vector3(0, 0, -1));
+  const rotated = look.clone().applyQuaternion(q);
+  const pos = new THREE.Vector3(0, 0, -0.038).sub(rotated);
+  return { pos, quat: q, look };
 }
 
 export function createWeapon(id = DEFAULT_WEAPON, world = false) {
@@ -1830,69 +2401,24 @@ export function createWeapon(id = DEFAULT_WEAPON, world = false) {
   g.scale.setScalar(target / len);
   g.updateMatrixWorld(true);
   box = gunBox(g);
+  const front = findFrontSight(g, box);
+  const rear = findRearSight(g, box);
+  const ads = computeAdsPose(rear, front);
   g.userData.grip = new THREE.Vector3(0, 0, 0);
-  g.userData.sight = findSightPoint(g, box);
+  g.userData.sight = ads.look;
+  g.userData.frontSight = front;
+  g.userData.adsPos = ads.pos;
+  g.userData.adsQuat = ads.quat;
+  g.userData.hipPos = new THREE.Vector3(0.22, -0.2, -Math.max(0.4, box.max.z + 0.16));
   g.userData.muzzle = new THREE.Vector3(0, Math.max(0.01, box.max.y * 0.28), box.min.z - 0.012);
   g.userData.weaponId = spec.id;
   g.userData.adsFov = spec.adsFov ?? 50;
   g.frustumCulled = false;
   g.traverse((obj) => {
     obj.frustumCulled = false;
+    if (!world && obj.isMesh && /stock/i.test(obj.name || "")) obj.visible = false;
   });
   return g;
-}
-
-function armorMat(color) {
-  return new THREE.MeshLambertMaterial({ color });
-}
-
-function limb(radius, len, mat) {
-  const mesh = new THREE.Mesh(new THREE.CapsuleGeometry(radius, len, 3, 8), mat);
-  mesh.castShadow = false;
-  mesh.receiveShadow = false;
-  return mesh;
-}
-
-function attachHands(holder) {
-  const plate = armorMat(0xcfc8bc, 0.58, 0.2);
-  const dark = armorMat(0x2a3038, 0.46, 0.32);
-  const glove = armorMat(0x14171c, 0.74, 0.06);
-  const s = 1.08;
-
-  const right = new THREE.Group();
-  const rHand = new THREE.Mesh(new THREE.BoxGeometry(0.072, 0.05, 0.1), glove);
-  const rGaunt = new THREE.Mesh(new THREE.BoxGeometry(0.088, 0.068, 0.11), dark);
-  const rFore = limb(0.03, 0.2, plate);
-  const rUpper = limb(0.038, 0.26, plate);
-  rHand.position.set(0.038, -0.044, 0.078);
-  rHand.rotation.set(0.42, 0.16, 0.84);
-  rGaunt.position.set(0.05, -0.024, 0.128);
-  rGaunt.rotation.set(0.32, 0.1, 0.7);
-  rFore.position.set(0.078, 0.02, 0.22);
-  rFore.rotation.set(-0.5, 0.1, 0.56);
-  rUpper.position.set(0.11, 0.1, 0.34);
-  rUpper.rotation.set(-0.82, 0.08, 0.4);
-  right.add(rHand, rGaunt, rFore, rUpper);
-  right.scale.setScalar(s);
-
-  const left = new THREE.Group();
-  const lHand = new THREE.Mesh(new THREE.BoxGeometry(0.068, 0.048, 0.092), glove);
-  const lGaunt = new THREE.Mesh(new THREE.BoxGeometry(0.082, 0.062, 0.1), dark);
-  const lFore = limb(0.028, 0.18, plate);
-  const lUpper = limb(0.036, 0.24, plate);
-  lHand.position.set(-0.028, -0.034, -0.148);
-  lHand.rotation.set(0.24, -0.14, -0.78);
-  lGaunt.position.set(-0.04, -0.014, -0.072);
-  lGaunt.rotation.set(0.18, -0.1, -0.6);
-  lFore.position.set(-0.072, 0.038, 0.048);
-  lFore.rotation.set(-0.4, -0.12, -0.62);
-  lUpper.position.set(-0.095, 0.12, 0.2);
-  lUpper.rotation.set(-0.78, -0.06, -0.4);
-  left.add(lHand, lGaunt, lFore, lUpper);
-  left.scale.setScalar(s);
-
-  holder.add(right, left);
-  holder.userData.hands = { left, right };
 }
 
 export function attachWeapon(fighter, weaponId) {

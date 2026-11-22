@@ -27,30 +27,42 @@ export async function loadOnlineConfig() {
   return loadedWs;
 }
 
+function pageHost() {
+  if (typeof location === "undefined") return "";
+  return location.hostname || "";
+}
+
+function wsProto() {
+  if (typeof location !== "undefined" && location.protocol === "https:") return "wss";
+  return "ws";
+}
+
 function sameOriginWs() {
-  if (typeof location === "undefined") return null;
-  const host = location.hostname || "";
-  if (!host || host === "localhost" || host === "127.0.0.1") return null;
+  const host = pageHost();
+  if (!host) return null;
   if (/\.github\.io$/i.test(host)) return null;
-  const ws = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${ws}//${location.host}`;
+  return `${wsProto()}://${location.host}`;
 }
 
 function resolveWsUrl() {
-  const hosted = loadedWs || envString("VITE_WS_URL").replace(/\/$/, "");
-  const local =
-    typeof location !== "undefined" && (location.hostname === "localhost" || location.hostname === "127.0.0.1");
-  const proto = typeof location !== "undefined" && location.protocol === "https:" ? "wss" : "ws";
-  const direct = local ? `${proto}://${location.hostname}:8787` : null;
-  const proxied = local ? `${proto}://${location.host}/ws` : null;
-  if (local) {
-    const fromEnv = envString("VITE_WS_URL").replace(/\/$/, "");
-    if (fromEnv) return { url: fromEnv, fallback: proxied };
-    return { url: direct, fallback: proxied && proxied !== direct ? proxied : null };
-  }
+  const hosted = (loadedWs || envString("VITE_WS_URL")).replace(/\/$/, "");
+  const host = pageHost();
+  const local = host === "localhost" || host === "127.0.0.1";
   const same = sameOriginWs();
+  const proto = wsProto();
+
+  // Vite HMR: page is :5173, game WS is :8787 (or /ws proxy). Production build
+  // served by Node (any PORT, including Render) must use same-origin wss/ws.
+  if (import.meta.env.DEV && local) {
+    const fromEnv = envString("VITE_WS_URL").replace(/\/$/, "");
+    const direct = `${proto}://${host}:8787`;
+    const proxied = `${proto}://${location.host}/ws`;
+    if (fromEnv) return { url: fromEnv, fallback: proxied };
+    return { url: direct, fallback: proxied !== direct ? proxied : null };
+  }
+
+  if (same) return { url: same, fallback: hosted && hosted !== same ? hosted : null };
   if (hosted) return { url: hosted, fallback: null };
-  if (same) return { url: same, fallback: null };
   if (DEFAULT_CLOUD_WS) return { url: DEFAULT_CLOUD_WS, fallback: null };
   return { url: null, fallback: null };
 }
@@ -72,6 +84,7 @@ export class NetClient {
     this.mode = "classic";
     this.maxPlayers = MAX_PLAYERS;
     this.phase = "";
+    this.mapId = "";
     this.players = [];
     this.connected = false;
     this.latency = 0;
@@ -215,6 +228,7 @@ export class NetClient {
       this.mode = msg.mode;
       this.maxPlayers = msg.maxPlayers;
       this.phase = msg.phase;
+      if (msg.mapId) this.mapId = msg.mapId;
       this.players = msg.players || [];
       this.handlers.onWelcome?.(msg);
       this.handlers.onLobby?.(msg);
@@ -224,6 +238,7 @@ export class NetClient {
       this.hostId = msg.hostId || this.hostId;
       this.mode = msg.mode || this.mode;
       this.phase = msg.phase || this.phase;
+      if (msg.mapId) this.mapId = msg.mapId;
       this.players = msg.players || this.players;
       this.handlers.onLobby?.(msg);
       return;
@@ -242,6 +257,7 @@ export class NetClient {
       this.phase = "play";
       this.hostId = msg.hostId || this.hostId;
       this.mode = msg.mode || this.mode;
+      if (msg.mapId) this.mapId = msg.mapId;
       this.players = msg.players || this.players;
       this.handlers.onBegin?.(msg);
       return;
@@ -343,6 +359,7 @@ export class NetClient {
     this.room = "";
     this.hostId = "";
     this.phase = "";
+    this.mapId = "";
     this.players = [];
     if (ws) {
       try {

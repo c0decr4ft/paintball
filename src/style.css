@@ -47,16 +47,16 @@ canvas {
   background:
     linear-gradient(
       108deg,
-      rgba(18, 8, 4, 0.82) 0%,
-      rgba(18, 8, 4, 0.32) 34%,
-      rgba(12, 6, 4, 0.06) 56%,
-      transparent 74%
+      rgba(18, 8, 4, 0.78) 0%,
+      rgba(18, 8, 4, 0.22) 26%,
+      rgba(12, 6, 4, 0.04) 48%,
+      transparent 62%
     ),
     linear-gradient(
       180deg,
       transparent 0%,
-      transparent 52%,
-      rgba(8, 4, 2, 0.58) 100%
+      transparent 58%,
+      rgba(8, 4, 2, 0.42) 100%
     );
 }
 
@@ -549,17 +549,6 @@ button.alt:hover {
   width: 100%;
   background: #e8b23a;
   box-shadow: 0 0 10px rgba(232, 178, 58, 0.45);
-}
-  position: absolute;
-  left: 50%;
-  bottom: 132px;
-  transform: translateX(-50%);
-  font-size: 12px;
-  letter-spacing: 0.28em;
-  text-transform: uppercase;
-  color: rgba(242, 239, 232, 0.72);
-  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.55);
-  white-space: nowrap;
 }
 
 .toast {

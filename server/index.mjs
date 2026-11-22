@@ -1,10 +1,11 @@
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, statSync } from "node:fs";
 import { dirname, join, extname, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createGzip } from "node:zlib";
 
-const PORT = Number(process.env.PORT || 8787);
+const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || "0.0.0.0";
 const ON_RENDER = Boolean(process.env.RENDER);
 const DIR = dirname(fileURLToPath(import.meta.url));
@@ -17,13 +18,40 @@ const STATIC_BASE = (process.env.STATIC_BASE !== undefined ? process.env.STATIC_
   /\/$/,
   ""
 );
+const REQUIRED_MODELS = [
+  "models/pvp_map.glb",
+  "models/castle_wars_pavlov_vr.glb",
+  "models/clone_commando.glb",
+  "models/phoenix.glb",
+  "models/blaster.glb",
+  "models/cs_go_bomb.glb",
+];
+const GZIP_TYPES = /^(text\/|application\/(javascript|json|wasm)|image\/svg\+xml)/i;
 const NET_TICK_MS = 1000 / 30;
 const MAX_PLAYERS = 10;
 const TEAM_CAP = 5;
 const NAME_MAX = 16;
 
+const PLAYABLE_MAP_IDS = ["pvp_map", "castle_wars"];
+
+function pickPlayableMapId() {
+  return Math.random() < 0.5 ? PLAYABLE_MAP_IDS[0] : PLAYABLE_MAP_IDS[1];
+}
+
+function validMapId(id) {
+  return PLAYABLE_MAP_IDS.includes(id) ? id : "";
+}
+
+/** Keep the room's map if set; otherwise pick 50/50 once. */
+function ensureRoomMap(room) {
+  const existing = validMapId(room.mapId);
+  if (existing) return existing;
+  room.mapId = pickPlayableMapId();
+  return room.mapId;
+}
+
 /** @typedef {{ id: string, name: string, team: "blue" | "red", ws: import("ws").WebSocket, room: string, alive: boolean, lastPoseAt: number, lastShootAt: number, pose: object }} Client */
-/** @typedef {{ name: string, password: string, maxPlayers: number, mode: "classic" | "bomb", hostId: string, phase: "lobby" | "play" | "over", site: "A" | "B", carrierId: string, blueScore: number, redScore: number, bots: object[], clients: Map<string, Client> }} Room */
+/** @typedef {{ name: string, password: string, maxPlayers: number, mode: "classic" | "bomb", hostId: string, phase: "lobby" | "play" | "over", site: "A" | "B", carrierId: string, mapId: string, blueScore: number, redScore: number, bots: object[], clients: Map<string, Client> }} Room */
 
 /** @type {Map<string, Room>} */
 const rooms = new Map();
@@ -134,6 +162,7 @@ function createMatchRoom() {
     phase: "lobby",
     site: "A",
     carrierId: "",
+    mapId: pickPlayableMapId(),
     blueScore: 0,
     redScore: 0,
     bots: [],
@@ -163,6 +192,7 @@ function lobbySnapshot(room) {
     maxPlayers: room.maxPlayers,
     mode: room.mode,
     phase: room.phase,
+    mapId: ensureRoomMap(room),
   };
 }
 
@@ -173,6 +203,7 @@ function beginPayload(room) {
     mode: room.mode,
     site: room.site,
     carrierId: room.carrierId,
+    mapId: ensureRoomMap(room),
     players: roomPlayers(room),
     blueScore: room.blueScore,
     redScore: room.redScore,
@@ -192,19 +223,65 @@ function resetRound(room) {
   room.bots = [];
 }
 
-function sendStaticFile(res, filePath) {
+function cacheControl(filePath, type) {
+  const unix = filePath.replaceAll("\\", "/");
+  const ext = extname(filePath).toLowerCase();
+  if (ext === ".html") return "no-cache";
+  if (unix.includes("/assets/") && /-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$/i.test(unix)) {
+    return "public, max-age=31536000, immutable";
+  }
+  if (ext === ".glb" || ext === ".woff2" || ext === ".png" || ext === ".webp") return "public, max-age=86400";
+  if (type.includes("javascript") || type.includes("css")) return "public, max-age=3600";
+  return "public, max-age=60";
+}
+
+function sendStaticFile(req, res, filePath) {
   try {
-    const data = readFileSync(filePath);
+    const stat = statSync(filePath);
+    if (!stat.isFile()) return false;
     const type = MIME[extname(filePath).toLowerCase()] || "application/octet-stream";
-    res.writeHead(200, { "Content-Type": type, "Cache-Control": "public, max-age=60" });
-    res.end(data);
+    const headers = {
+      "Content-Type": type,
+      "Cache-Control": cacheControl(filePath, type),
+      "X-Content-Type-Options": "nosniff",
+    };
+    if (type.startsWith("text/html")) {
+      headers["Cross-Origin-Opener-Policy"] = "same-origin";
+    }
+    const gzip = GZIP_TYPES.test(type) && /\bgzip\b/.test(String(req.headers["accept-encoding"] || ""));
+    if (req.method === "HEAD") {
+      if (!gzip) headers["Content-Length"] = stat.size;
+      res.writeHead(200, headers);
+      res.end();
+      return true;
+    }
+    const stream = createReadStream(filePath);
+    stream.on("error", (err) => {
+      console.error(`[static] ${filePath}: ${err.message}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      }
+      res.end();
+    });
+    req.on("close", () => stream.destroy());
+    if (gzip) {
+      headers["Content-Encoding"] = "gzip";
+      headers.Vary = "Accept-Encoding";
+      res.writeHead(200, headers);
+      stream.pipe(createGzip()).pipe(res);
+      return true;
+    }
+    headers["Content-Length"] = stat.size;
+    res.writeHead(200, headers);
+    stream.pipe(res);
     return true;
-  } catch {
+  } catch (err) {
+    console.error(`[static] ${filePath}: ${err.message}`);
     return false;
   }
 }
 
-function tryServeStatic(urlPath, res) {
+function tryServeStatic(req, urlPath, res) {
   if (!DIST_DIR) return false;
   let path = urlPath.split("?")[0] || "/";
   if (STATIC_BASE) {
@@ -224,10 +301,46 @@ function tryServeStatic(urlPath, res) {
     .replace(/^\//, "");
   const filePath = join(DIST_DIR, rel || "index.html");
   if (!filePath.startsWith(DIST_DIR)) return false;
-  if (existsSync(filePath) && statSync(filePath).isFile()) return sendStaticFile(res, filePath);
+  if (existsSync(filePath) && statSync(filePath).isFile()) return sendStaticFile(req, res, filePath);
   const index = join(DIST_DIR, "index.html");
-  if (existsSync(index) && !rel.includes(".")) return sendStaticFile(res, index);
+  if (existsSync(index) && !rel.includes(".")) return sendStaticFile(req, res, index);
   return false;
+}
+
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+function sendHealth(res) {
+  setCors(res);
+  res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(
+    JSON.stringify({
+      ok: true,
+      uptime: process.uptime(),
+      rooms: rooms.size,
+      dist: Boolean(DIST_DIR),
+    })
+  );
+}
+
+function warnMissingAssets() {
+  if (!DIST_DIR) {
+    const msg = ON_RENDER
+      ? "[static] dist/ missing — run `npm run build` in the Render build command or the game will 404"
+      : "[static] dist/ missing — HTTP is WS-only. Run `npm run build` then `npm start` to serve the game";
+    console.error(msg);
+    return;
+  }
+  const missing = REQUIRED_MODELS.filter((rel) => !existsSync(join(DIST_DIR, rel)));
+  if (missing.length) {
+    console.error(`[static] missing models in dist/: ${missing.join(", ")}`);
+    console.error("[static] commit the GLBs (see .gitignore exceptions) or they 404 on Render");
+  } else {
+    console.log(`[static] ${DIST_DIR} (${REQUIRED_MODELS.length} runtime models present)`);
+  }
 }
 
 /**
@@ -272,6 +385,7 @@ function admitToRoom(ws, msg, room) {
     mode: room.mode,
     maxPlayers: room.maxPlayers,
     phase: room.phase === "lobby" ? "play" : room.phase,
+    mapId: ensureRoomMap(room),
     players: roomPlayers(room),
   });
   broadcast(room, lobbySnapshot(room));
@@ -329,6 +443,7 @@ function admitClient(ws, msg, mode) {
       phase: "lobby",
       site: "A",
       carrierId: "",
+      mapId: pickPlayableMapId(),
       blueScore: 0,
       redScore: 0,
       bots: [],
@@ -389,14 +504,21 @@ function dropClient(client) {
 const httpServer = createServer((req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
-  if (url.pathname === "/healthz" || url.pathname === "/api/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, uptime: process.uptime(), rooms: rooms.size }));
+  if (req.method === "OPTIONS") {
+    setCors(res);
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  if (url.pathname === "/health" || url.pathname === "/healthz" || url.pathname === "/api/health") {
+    sendHealth(res);
     return;
   }
 
   if (url.pathname === "/api/status") {
-    res.writeHead(200, { "Content-Type": "application/json" });
+    setCors(res);
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(
       JSON.stringify({
         ok: true,
@@ -413,14 +535,17 @@ const httpServer = createServer((req, res) => {
   }
 
   if (req.method === "GET" || req.method === "HEAD") {
-    if (tryServeStatic(url.pathname, res)) return;
+    if (tryServeStatic(req, url.pathname, res)) return;
   }
 
-  res.writeHead(404, { "Content-Type": "application/json" });
+  res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify({ ok: false, error: "not found" }));
 });
 
-const wss = new WebSocketServer({ server: httpServer });
+const wss = new WebSocketServer({ server: httpServer, perMessageDeflate: false });
+wss.on("error", (err) => {
+  console.error(`[ws] ${err.message}`);
+});
 
 wss.on("connection", (ws) => {
   ws._socket?.setNoDelay?.(true);
@@ -648,6 +773,16 @@ setInterval(() => {
   }
 }, NET_TICK_MS).unref();
 
+httpServer.on("error", (err) => {
+  console.error(`[listen] ${err.message}`);
+  process.exit(1);
+});
+
+warnMissingAssets();
+
 httpServer.listen(PORT, HOST, () => {
-  console.log(`Paintfield http://${HOST}:${PORT} (WS${DIST_DIR ? ` + static ${STATIC_BASE || "/"}` : ""})`);
+  const env = process.env.NODE_ENV || "development";
+  console.log(
+    `PAIN - FIELD http://${HOST}:${PORT} (${env}${ON_RENDER ? " render" : ""} · WS${DIST_DIR ? ` + static ${STATIC_BASE || "/"}` : ""})`
+  );
 });

@@ -33,9 +33,18 @@ try {
   showLoadError(err);
 }
 
-function loop() {
-  if (game) game.tick();
+const FRAME_MS = 1000 / 60;
+let last = performance.now();
+let acc = 0;
+
+function loop(now) {
   requestAnimationFrame(loop);
+  acc += now - last;
+  last = now;
+  if (acc > FRAME_MS * 4) acc = FRAME_MS;
+  if (acc < FRAME_MS) return;
+  acc -= FRAME_MS;
+  if (game) game.tick();
 }
 
 requestAnimationFrame(loop);

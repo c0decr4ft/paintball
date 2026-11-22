@@ -2,8 +2,10 @@ node_modules
 dist
 .DS_Store
 .verify-*.png
+# Unused / huge maps stay local. Runtime guns+map+characters MUST ship to Render.
 public/models/*
 !public/models/pvp_map.glb
+!public/models/castle_wars_pavlov_vr.glb
 !public/models/clone_commando.glb
 !public/models/blaster.glb
 !public/models/phoenix.glb

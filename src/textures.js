@@ -381,7 +381,7 @@ export function gymCourtFloorTexture() {
 }
 
 export function warehouseWallTexture() {
-  return gymCourtWallTexture();
+  return villageWallTexture();
 }
 
 let _villageWall = null;
@@ -495,7 +495,7 @@ export function villageWallTexture() {
 let _pebbleFloor = null;
 
 export function warehouseFloorTexture() {
-  return gymCourtFloorTexture();
+  return villageFloorTexture();
 }
 
 /** Packed pebble gravel — small stones, seamless tile. */
